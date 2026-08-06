@@ -42,10 +42,11 @@ def parse_brocker_pdf(pdf_file):
                 or "DATA SERVIÇO" in line_str
                 or "EMISSÃO:" in line_str
                 or "ORIGEM:" in line_str
-                if "SERVIÇO:" in line_str
+                or "SERVIÇO:" in line_str
                 or "Pagina" in line_str
-                or "TOTAL" in line_str:
-                    continue
+                or "TOTAL" in line_str
+            ):
+                continue
 
             # Captura o cabeçalho do Cliente / File
             # Ex: "721074 - ELIAS FRANCISCO DE AGUIAR JUNIOR (SITE BROCKER)"
@@ -121,7 +122,6 @@ def parse_brocker_pdf(pdf_file):
                 # Tratar valores de venda e voucher/tarifa
                 if len(tokens) >= 6:
                     raw_val = tokens[5].replace(".", "").replace(",", ".")
-                    # Se vierem dois valores grudados (ex: 496,00248,00)
                     vals = re.findall(r"\d+\.?\d*", raw_val)
                     if len(vals) >= 2:
                         valor_venda = float(vals[0])
@@ -143,14 +143,14 @@ def parse_brocker_pdf(pdf_file):
                     "INF": inf,
                     "QTD": qtd,
                     "VOUCHER_RECIBO": voucher_recibo,
-                    "TARIFA": None,  # Mantido nulo igual a sua planilha
+                    "TARIFA": None,
                     "VALOR_VENDA": valor_venda,
                     "VALOR_FEE": valor_fee,
                 })
 
     df = pd.DataFrame(records)
 
-    # Adicionar a linha do TOTAL no final igual à sua planilha
+    # Adicionar a linha do TOTAL no final
     if not df.empty:
         total_venda = df["VALOR_VENDA"].sum()
         total_fee = df["VALOR_FEE"].sum()
