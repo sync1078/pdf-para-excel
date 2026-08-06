@@ -8,7 +8,7 @@ st.set_page_config(
     page_title="Conversor PDF para Excel", page_icon="📊", layout="wide"
 )
 
-st.title("📊 Conversor de Relatórios (PDF → Excel)")
+st.title("📊 Conversor de Relatórios Brocker / Bustour (PDF → Excel)")
 st.write(
     "Upload do relatório em PDF para gerar a planilha formatada no padrão exato do seu Banco de Dados."
 )
@@ -16,6 +16,44 @@ st.write(
 uploaded_file = st.file_uploader(
     "Arraste ou selecione o arquivo PDF do relatório", type=["pdf"]
 )
+
+
+def adjust_fees_to_match_target(df_input, target_fee):
+    df = df_input.copy()
+    current_sum = round(df["VALOR_FEE"].sum(), 2)
+    diff = round(current_sum - target_fee, 2)
+
+    if diff == 0:
+        return df
+
+    cents_to_adjust = int(round(abs(diff) * 100))
+    step = -0.01 if diff > 0 else 0.01
+
+    df["raw_fee"] = df["VALOR_VENDA"] * 0.01
+    df["round_diff"] = df["VALOR_FEE"] - df["raw_fee"]
+
+    if diff > 0:
+        candidates = (
+            df[df["round_diff"] > 0]
+            .sort_values(by="round_diff", ascending=False)
+            .index
+        )
+    else:
+        candidates = (
+            df[df["round_diff"] < 0]
+            .sort_values(by="round_diff", ascending=True)
+            .index
+        )
+
+    adjusted_count = 0
+    for idx in candidates:
+        if adjusted_count >= cents_to_adjust:
+            break
+        df.loc[idx, "VALOR_FEE"] = round(df.loc[idx, "VALOR_FEE"] + step, 2)
+        adjusted_count += 1
+
+    df.drop(columns=["raw_fee", "round_diff"], inplace=True)
+    return df
 
 
 def parse_brocker_pdf(pdf_file):
@@ -100,7 +138,6 @@ def parse_brocker_pdf(pdf_file):
                     else (adt + chd + inf)
                 )
 
-                # Ordem dos monetários no PDF: 0 -> FEE impresso, 1 -> VALOR_VENDA, 2 -> VOUCHER_RECIBO
                 valor_fee = to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
                 valor_venda = (
                     to_float(monetaries[1]) if len(monetaries) > 1 else 0.0
@@ -130,11 +167,12 @@ def parse_brocker_pdf(pdf_file):
 
     df = pd.DataFrame(records)
 
-    # Adicionar a linha do TOTAL idêntica ao rodapé oficial do relatório PDF
     if not df.empty:
-        total_venda = df["VALOR_VENDA"].sum()
-        # Cálculo oficial do total do fee igual ao rodapé do PDF (1% da venda total)
+        total_venda = round(df["VALOR_VENDA"].sum(), 2)
         total_fee = round(total_venda * 0.01, 2)
+
+        # Reajuste Fino: ajusta as linhas para que a soma da coluna no Excel dê exatamente o total do rodapé
+        df = adjust_fees_to_match_target(df, total_fee)
 
         row_total = {
             "FILE": "TOTAL",
