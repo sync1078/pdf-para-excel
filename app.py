@@ -49,7 +49,6 @@ def parse_brocker_pdf(pdf_file):
                 continue
 
             # Captura o cabeçalho do Cliente / File
-            # Ex: "721074 - ELIAS FRANCISCO DE AGUIAR JUNIOR (SITE BROCKER)"
             client_match = re.search(
                 r"^(\d+)\s*[-–]?\s*(.*?)\s*\((SITE\s+[^\)]+)\)", line_str
             )
@@ -73,65 +72,45 @@ def parse_brocker_pdf(pdf_file):
                 pct_match = re.search(r"(\d+[\.,]\d+\s*%)", resto)
                 if pct_match:
                     categoria = resto[pct_match.end() :].strip()
-                    numeros_str = resto[: pct_match.start()].strip()
+                    nums_part = resto[: pct_match.start()].strip()
                 else:
                     categoria = ""
-                    numeros_str = resto
+                    nums_part = resto
 
-                # Extrai os números e valores
-                tokens = numeros_str.split()
+                # Extrair valores monetários com vírgula (Ex: 496,00 ou 248,00 ou 4,96)
+                monetaries = re.findall(r"\d+(?:\.\d{3})*,\d{2}", nums_part)
 
-                adt = 0.0
-                chd = 0.0
-                inf = 0.0
-                qtd = 0.0
-                valor_fee = 0.0
-                valor_venda = 0.0
-                voucher_recibo = 0.0
+                # Limpar monetários para extrair inteiros (ADT, CHD, INF, QTD)
+                cleaned_nums = nums_part
+                for m in monetaries:
+                    cleaned_nums = cleaned_nums.replace(m, " ")
 
-                if len(tokens) >= 1:
-                    try:
-                        adt = float(tokens[0].replace(",", "."))
-                    except:
-                        pass
+                integers = re.findall(r"\b\d+\b", cleaned_nums)
 
-                if len(tokens) >= 2:
-                    try:
-                        valor_fee = float(tokens[1].replace(",", "."))
-                    except:
-                        pass
+                adt = float(integers[0]) if len(integers) > 0 else 0.0
+                chd = float(integers[1]) if len(integers) > 1 else 0.0
+                inf = float(integers[2]) if len(integers) > 2 else 0.0
+                qtd = (
+                    float(integers[3])
+                    if len(integers) > 3
+                    else (adt + chd + inf)
+                )
 
-                if len(tokens) >= 3:
-                    try:
-                        chd = float(tokens[2].replace(",", "."))
-                    except:
-                        pass
+                def to_float(val_str):
+                    return float(val_str.replace(".", "").replace(",", "."))
 
-                if len(tokens) >= 4:
-                    try:
-                        inf = float(tokens[3].replace(",", "."))
-                    except:
-                        pass
-
-                if len(tokens) >= 5:
-                    try:
-                        qtd = float(tokens[4].replace(",", "."))
-                    except:
-                        pass
-
-                # Tratar valores de venda e voucher/tarifa
-                if len(tokens) >= 6:
-                    raw_val = tokens[5].replace(".", "").replace(",", ".")
-                    vals = re.findall(r"\d+\.?\d*", raw_val)
-                    if len(vals) >= 2:
-                        valor_venda = float(vals[0])
-                        voucher_recibo = float(vals[1])
-                    elif len(vals) == 1:
-                        valor_venda = float(vals[0])
+                # Mapeamento dos valores monetários capturados
+                valor_fee = to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
+                valor_venda = (
+                    to_float(monetaries[1]) if len(monetaries) > 1 else 0.0
+                )
+                voucher_recibo = (
+                    to_float(monetaries[2]) if len(monetaries) > 2 else 0.0
+                )
 
                 records.append({
                     "FILE": int(current_file)
-                    if current_file.isdigit()
+                    if str(current_file).isdigit()
                     else current_file,
                     "NOME_CLIENTE": current_client,
                     "SITE_ORIGEM": current_site,
