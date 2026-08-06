@@ -81,10 +81,10 @@ def parse_brocker_pdf(pdf_file):
                     categoria = ""
                     nums_part = resto
 
-                # Extrai os valores monetários com vírgula (ex: 4,96 / 496,00 / 248,00)
+                # Extrai todos os valores monetários com vírgula
                 monetaries = re.findall(r"\d+(?:\.\d{3})*,\d{2}", nums_part)
 
-                # Limpa os números monetários para isolar os inteiros (ADT, CHD, INF, QTD)
+                # Limpa os números monetários para isolar inteiros (ADT, CHD, INF, QTD)
                 cleaned_nums = nums_part
                 for m in monetaries:
                     cleaned_nums = cleaned_nums.replace(m, " ")
@@ -100,7 +100,7 @@ def parse_brocker_pdf(pdf_file):
                     else (adt + chd + inf)
                 )
 
-                # Ordem correta dos monetários: 0 -> FEE, 1 -> VALOR_VENDA, 2 -> VOUCHER_RECIBO
+                # Ordem dos monetários no PDF: 0 -> FEE impresso, 1 -> VALOR_VENDA, 2 -> VOUCHER_RECIBO
                 valor_fee = to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
                 valor_venda = (
                     to_float(monetaries[1]) if len(monetaries) > 1 else 0.0
@@ -130,10 +130,11 @@ def parse_brocker_pdf(pdf_file):
 
     df = pd.DataFrame(records)
 
-    # Adicionar a linha do TOTAL no final
+    # Adicionar a linha do TOTAL idêntica ao rodapé oficial do relatório PDF
     if not df.empty:
         total_venda = df["VALOR_VENDA"].sum()
-        total_fee = df["VALOR_FEE"].sum()
+        # Cálculo oficial do total do fee igual ao rodapé do PDF (1% da venda total)
+        total_fee = round(total_venda * 0.01, 2)
 
         row_total = {
             "FILE": "TOTAL",
