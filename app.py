@@ -26,6 +26,9 @@ def parse_brocker_pdf(pdf_file):
     current_client = ""
     current_site = ""
 
+    def to_float(val_str):
+        return float(val_str.replace(".", "").replace(",", "."))
+
     for page in reader.pages:
         text = page.extract_text()
         if not text:
@@ -78,10 +81,10 @@ def parse_brocker_pdf(pdf_file):
                     categoria = ""
                     nums_part = resto
 
-                # Extrai todos os números com decimais
+                # Extrai os valores monetários com vírgula (ex: 4,96 / 496,00 / 248,00)
                 monetaries = re.findall(r"\d+(?:\.\d{3})*,\d{2}", nums_part)
 
-                # Limpa os números monetários para extrair inteiros (ADT, CHD, INF, QTD)
+                # Limpa os números monetários para isolar os inteiros (ADT, CHD, INF, QTD)
                 cleaned_nums = nums_part
                 for m in monetaries:
                     cleaned_nums = cleaned_nums.replace(m, " ")
@@ -97,24 +100,14 @@ def parse_brocker_pdf(pdf_file):
                     else (adt + chd + inf)
                 )
 
-                def to_float(val_str):
-                    return float(val_str.replace(".", "").replace(",", "."))
-
-                # Ajuste de Mapeamento Numérico
-                valor_venda = 0.0
-                voucher_recibo = 0.0
-
-                if len(monetaries) >= 3:
-                    valor_venda = to_float(monetaries[1])
-                    voucher_recibo = to_float(monetaries[2])
-                elif len(monetaries) == 2:
-                    valor_venda = to_float(monetaries[1])
-                    voucher_recibo = to_float(monetaries[0])
-                elif len(monetaries) == 1:
-                    valor_venda = to_float(monetaries[0])
-
-                # O FEE é sempre 1% sobre o Valor Venda
-                valor_fee = round(valor_venda * 0.01, 2)
+                # Ordem correta dos monetários: 0 -> FEE, 1 -> VALOR_VENDA, 2 -> VOUCHER_RECIBO
+                valor_fee = to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
+                valor_venda = (
+                    to_float(monetaries[1]) if len(monetaries) > 1 else 0.0
+                )
+                voucher_recibo = (
+                    to_float(monetaries[2]) if len(monetaries) > 2 else 0.0
+                )
 
                 records.append({
                     "FILE": int(current_file)
