@@ -44,13 +44,14 @@ def parse_brocker_pdf(pdf_file):
                 or "ORIGEM:" in line_str
                 or "SERVIÇO:" in line_str
                 or "Pagina" in line_str
+                or "Página" in line_str
                 or "TOTAL" in line_str
             ):
                 continue
 
             # Captura o cabeçalho do Cliente / File
             client_match = re.search(
-                r"^(\d+)\s*[-–]?\s*(.*?)\s*\((SITE\s+[^\)]+)\)", line_str
+                r"^(\d+)\s*[-–]?\s*(.*?)\s*\(([^\)]+)\)", line_str
             )
             if client_match:
                 current_file = client_match.group(1).strip()
@@ -77,10 +78,10 @@ def parse_brocker_pdf(pdf_file):
                     categoria = ""
                     nums_part = resto
 
-                # Extrair valores monetários com vírgula (Ex: 496,00 ou 248,00 ou 4,96)
+                # Extrai todos os números com decimais
                 monetaries = re.findall(r"\d+(?:\.\d{3})*,\d{2}", nums_part)
 
-                # Limpar monetários para extrair inteiros (ADT, CHD, INF, QTD)
+                # Limpa os números monetários para extrair inteiros (ADT, CHD, INF, QTD)
                 cleaned_nums = nums_part
                 for m in monetaries:
                     cleaned_nums = cleaned_nums.replace(m, " ")
@@ -99,14 +100,21 @@ def parse_brocker_pdf(pdf_file):
                 def to_float(val_str):
                     return float(val_str.replace(".", "").replace(",", "."))
 
-                # Mapeamento dos valores monetários capturados
-                valor_fee = to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
-                valor_venda = (
-                    to_float(monetaries[1]) if len(monetaries) > 1 else 0.0
-                )
-                voucher_recibo = (
-                    to_float(monetaries[2]) if len(monetaries) > 2 else 0.0
-                )
+                # Ajuste de Mapeamento Numérico
+                valor_venda = 0.0
+                voucher_recibo = 0.0
+
+                if len(monetaries) >= 3:
+                    valor_venda = to_float(monetaries[1])
+                    voucher_recibo = to_float(monetaries[2])
+                elif len(monetaries) == 2:
+                    valor_venda = to_float(monetaries[1])
+                    voucher_recibo = to_float(monetaries[0])
+                elif len(monetaries) == 1:
+                    valor_venda = to_float(monetaries[0])
+
+                # O FEE é sempre 1% sobre o Valor Venda
+                valor_fee = round(valor_venda * 0.01, 2)
 
                 records.append({
                     "FILE": int(current_file)
