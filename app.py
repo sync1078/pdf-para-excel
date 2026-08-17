@@ -8,7 +8,7 @@ st.set_page_config(
     page_title="Conversor PDF para Excel PRO", page_icon="📊", layout="wide"
 )
 
-st.title("📊 Conversor de Relatórios Brocker / Bustour / ManageTour")
+st.title("📊 Conversor de Relatórios")
 st.write(
     "Upload de relatórios em PDF (Detalhados ou Sumários) para gerar planilhas formatadas para Banco de Dados."
 )
