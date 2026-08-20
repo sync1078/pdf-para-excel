@@ -30,7 +30,7 @@ uploaded_file = st.file_uploader(
 
 
 def to_float(val_str):
-    """Converte valores no padrão brasileiro (1.218,00) para float."""
+    """Converte valores no padrão brasileiro (1.218,00 ou 88,00) para float."""
     if not val_str or str(val_str).strip() == "":
         return 0.0
     clean_str = (
@@ -85,22 +85,16 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-# --- PARSER 1: SUMÁRIO (EXTRAÇÃO LINHA A LINHA OTIMIZADA) ---
+# --- PARSER 1: SUMÁRIO (ANALISADOR POR EXTRAÇÃO DE TOKENS NUMÉRICOS) ---
 def parse_sumario_pdfplumber(pdf_file):
     records = []
 
-    # Regex para alinhar estritamente os campos:
-    # 1. Sequencial da margem (opcional): ex "3928"
-    # 2. ID File real (obrigatório): ex "723.176" ou "597.762"
-    # 3. Quatro colunas monetárias (obrigatórias)
-    pattern_line = re.compile(
-        r"(?:^\d+\s*\|\s*)?(\d{3}[\.:]?\d{3})\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)"
-    )
+    # Regex para identificar números monetários (com vírgula) ou o Id File (ex: 597.762 ou 597762)
+    pattern_num = re.compile(r"\b\d+(?:[\.,:\s]\d+)*\b")
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            # Layout=True preserva os alinhamentos horizontais exatos das colunas
-            text = page.extract_text(layout=False)
+            text = page.extract_text()
             if not text:
                 page.flush_cache()
                 continue
@@ -109,6 +103,7 @@ def parse_sumario_pdfplumber(pdf_file):
             for line in lines:
                 line_str = line.strip()
 
+                # Ignora cabeçalhos, rodapés e a linha final nativa de Total Geral do PDF
                 if (
                     not line_str
                     or "SUMÁRIO" in line_str.upper()
@@ -119,36 +114,43 @@ def parse_sumario_pdfplumber(pdf_file):
                 ):
                     continue
 
-                match = pattern_line.search(line_str)
-                if match:
-                    id_file_raw = (
-                        match.group(1).replace(":", ".").replace(" ", ".")
-                    )
+                # Extrai todos os números soltos na linha ignorando barras e pipes
+                clean_line = line_str.replace("|", " ")
+                tokens = pattern_num.findall(clean_line)
 
-                    if "." not in id_file_raw and len(id_file_raw) == 6:
-                        id_file_str = f"{id_file_raw[:3]}.{id_file_raw[3:]}"
-                    else:
-                        id_file_str = id_file_raw
+                # Uma linha válida precisa ter ao menos o Id File e os 4 valores
+                for idx, token in enumerate(tokens):
+                    # Remove caracteres espúrios para validar o Id File
+                    clean_token = token.replace(".", "").replace(":", "").strip()
 
-                    total_geral = to_float(match.group(2))
-                    receita_op = to_float(match.group(3))
-                    custo_rateio = to_float(match.group(4))
-                    total_net = to_float(match.group(5))
+                    # Verifica se o token tem 6 dígitos (o tamanho exato do Id File)
+                    if len(clean_token) == 6 and clean_token.isdigit():
+                        remaining_tokens = tokens[idx + 1 :]
 
-                    records.append({
-                        "ID_FILE": id_file_str,
-                        "TOTAL_GERAL": total_geral,
-                        "RECEITA_OPERACIONAL": receita_op,
-                        "CUSTO_OPERACAO_RATEIO": custo_rateio,
-                        "TOTAL_NET_PREVISTO": total_net,
-                    })
+                        # Se houver 4 ou mais valores após o ID, captura os 4 primeiros monetários
+                        if len(remaining_tokens) >= 4:
+                            id_file_str = f"{clean_token[:3]}.{clean_token[3:]}"
 
-            # Libera a memória da página processada para evitar crash (Error Oh No)
+                            total_geral = to_float(remaining_tokens[0])
+                            receita_op = to_float(remaining_tokens[1])
+                            custo_rateio = to_float(remaining_tokens[2])
+                            total_net = to_float(remaining_tokens[3])
+
+                            records.append({
+                                "ID_FILE": id_file_str,
+                                "TOTAL_GERAL": total_geral,
+                                "RECEITA_OPERACIONAL": receita_op,
+                                "CUSTO_OPERACAO_RATEIO": custo_rateio,
+                                "TOTAL_NET_PREVISTO": total_net,
+                            })
+                            break
+
             page.flush_cache()
 
     df = pd.DataFrame(records)
 
     if not df.empty:
+        # Adiciona a linha de TOTAL GERAL no final do Excel com o somatório exato
         row_total = {
             "ID_FILE": "TOTAL GERAL",
             "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
@@ -163,7 +165,7 @@ def parse_sumario_pdfplumber(pdf_file):
     return df
 
 
-# --- PARSER 2: BROCKER DETALHADO ---
+# --- PARSER 2: MODELO BROCKER / BUSTOUR DETALHADO ---
 def parse_brocker_pdf(pdf_file):
     reader = pypdf.PdfReader(pdf_file)
     records = []
