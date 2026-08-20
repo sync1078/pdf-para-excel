@@ -85,72 +85,74 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-# --- PARSER 1: SUMÁRIO (ANALISADOR POR EXTRAÇÃO DE TOKENS NUMÉRICOS) ---
+# --- PARSER 1: SUMÁRIO / MANUTENÇÃO COMISSIONADA (ROBUSTO COM TABELAS) ---
 def parse_sumario_pdfplumber(pdf_file):
     records = []
 
-    # Regex para identificar números monetários (com vírgula) ou o Id File (ex: 597.762 ou 597762)
-    pattern_num = re.compile(r"\b\d+(?:[\.,:\s]\d+)*\b")
+    # Configuração de extração do pdfplumber para não perder colunas sem bordas
+    table_settings = {
+        "vertical_strategy": "text",
+        "horizontal_strategy": "text",
+        "snap_tolerance": 3,
+    }
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            text = page.extract_text()
-            if not text:
-                page.flush_cache()
-                continue
+            tables = page.extract_tables(table_settings)
 
-            lines = text.split("\n")
-            for line in lines:
-                line_str = line.strip()
+            for table in tables:
+                for row in table:
+                    # Limpa células e remove valores vazios
+                    row_clean = [
+                        str(cell).replace("\n", " ").strip()
+                        for cell in row
+                        if cell is not None
+                    ]
 
-                # Ignora cabeçalhos, rodapés e a linha final nativa de Total Geral do PDF
-                if (
-                    not line_str
-                    or "SUMÁRIO" in line_str.upper()
-                    or "TOTAL GERAL" in line_str.upper()
-                    or "RECEITA OPERACIONAL" in line_str.upper()
-                    or "ID FILE" in line_str.upper()
-                    or "HTTPS://" in line_str.lower()
-                ):
-                    continue
+                    # Filtra apenas o conteúdo válido da linha
+                    cells = [c for c in row_clean if c != ""]
+                    line_text = " ".join(cells).upper()
 
-                # Extrai todos os números soltos na linha ignorando barras e pipes
-                clean_line = line_str.replace("|", " ")
-                tokens = pattern_num.findall(clean_line)
+                    # Descartar cabeçalhos, rodapés e linha final de Total Geral nativa do PDF
+                    if (
+                        "SUMÁRIO" in line_text
+                        or "RECEITA OPERACIONAL" in line_text
+                        or "TOTAL GERAL" in line_text
+                        or "ID FILE" in line_text
+                        or "HTTPS://" in line_text.lower()
+                    ):
+                        continue
 
-                # Uma linha válida precisa ter ao menos o Id File e os 4 valores
-                for idx, token in enumerate(tokens):
-                    # Remove caracteres espúrios para validar o Id File
-                    clean_token = token.replace(".", "").replace(":", "").strip()
+                    # Procura o token que possui o formato do ID FILE (6 dígitos com ou sem ponto)
+                    for idx, cell in enumerate(cells):
+                        match_id = re.search(r"\b(\d{3}[\.:]?\d{3})\b", cell)
 
-                    # Verifica se o token tem 6 dígitos (o tamanho exato do Id File)
-                    if len(clean_token) == 6 and clean_token.isdigit():
-                        remaining_tokens = tokens[idx + 1 :]
+                        if match_id:
+                            id_raw = match_id.group(1).replace(":", ".").strip()
+                            clean_digits = id_raw.replace(".", "")
 
-                        # Se houver 4 ou mais valores após o ID, captura os 4 primeiros monetários
-                        if len(remaining_tokens) >= 4:
-                            id_file_str = f"{clean_token[:3]}.{clean_token[3:]}"
+                            if len(clean_digits) == 6 and clean_digits.isdigit():
+                                id_file_str = f"{clean_digits[:3]}.{clean_digits[3:]}"
+                                remaining = cells[idx + 1 :]
 
-                            total_geral = to_float(remaining_tokens[0])
-                            receita_op = to_float(remaining_tokens[1])
-                            custo_rateio = to_float(remaining_tokens[2])
-                            total_net = to_float(remaining_tokens[3])
+                                # Extrai os 4 valores monetários à direita do ID
+                                if len(remaining) >= 4:
+                                    records.append({
+                                        "ID_FILE": id_file_str,
+                                        "TOTAL_GERAL": to_float(remaining[0]),
+                                        "RECEITA_OPERACIONAL": to_float(remaining[1]),
+                                        "CUSTO_OPERACAO_RATEIO": to_float(remaining[2]),
+                                        "TOTAL_NET_PREVISTO": to_float(remaining[3]),
+                                    })
+                                break
 
-                            records.append({
-                                "ID_FILE": id_file_str,
-                                "TOTAL_GERAL": total_geral,
-                                "RECEITA_OPERACIONAL": receita_op,
-                                "CUSTO_OPERACAO_RATEIO": custo_rateio,
-                                "TOTAL_NET_PREVISTO": total_net,
-                            })
-                            break
-
+            # Limpa cache para economizar memória e evitar queda no Streamlit Cloud
             page.flush_cache()
 
     df = pd.DataFrame(records)
 
     if not df.empty:
-        # Adiciona a linha de TOTAL GERAL no final do Excel com o somatório exato
+        # Gera a linha do TOTAL GERAL somando as colunas no Python
         row_total = {
             "ID_FILE": "TOTAL GERAL",
             "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
@@ -303,7 +305,7 @@ if uploaded_file is not None:
     try:
         if (
             tipo_relatorio
-            == "Sumário / Manutenção Comissionada (Tabela por Id File)"
+            == "Sumário / Manutenção ComISSIONADA (Tabela por Id File)"
         ):
             df_result = parse_sumario_pdfplumber(uploaded_file)
         else:
