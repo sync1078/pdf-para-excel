@@ -85,74 +85,105 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-# --- PARSER 1: SUMÁRIO / MANUTENÇÃO COMISSIONADA (ROBUSTO COM TABELAS) ---
+# --- PARSER 1: SUMÁRIO (EXTRAÇÃO VIA PALAVRAS E POSICIONAMENTO) ---
 def parse_sumario_pdfplumber(pdf_file):
     records = []
 
-    # Configuração de extração do pdfplumber para não perder colunas sem bordas
-    table_settings = {
-        "vertical_strategy": "text",
-        "horizontal_strategy": "text",
-        "snap_tolerance": 3,
-    }
+    # Regex para identificar ID FILE com 6 dígitos (ex: 597.762, 609.176, 679:040)
+    pattern_id = re.compile(r"^(\d{3}[\.:]?\d{3})$")
+    # Regex para identificar números monetários (ex: 1.218,00 ou 88,00 ou 0,00)
+    pattern_money = re.compile(r"^\d+(?:\.\d{3})*,\d{2}$")
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables(table_settings)
+            words = page.extract_words()
+            if not words:
+                page.flush_cache()
+                continue
 
-            for table in tables:
-                for row in table:
-                    # Limpa células e remove valores vazios
-                    row_clean = [
-                        str(cell).replace("\n", " ").strip()
-                        for cell in row
-                        if cell is not None
-                    ]
+            # Agrupa as palavras da página pelo eixo Y (mesma linha visual)
+            lines_dict = {}
+            for w in words:
+                top_key = round(w["top"], 1)
+                # Tolera pequenas variações de alinhamento vertical
+                matched_key = None
+                for k in lines_dict.keys():
+                    if abs(k - top_key) <= 3:
+                        matched_key = k
+                        break
 
-                    # Filtra apenas o conteúdo válido da linha
-                    cells = [c for c in row_clean if c != ""]
-                    line_text = " ".join(cells).upper()
+                if matched_key is None:
+                    lines_dict[top_key] = [w]
+                else:
+                    lines_dict[matched_key].append(w)
 
-                    # Descartar cabeçalhos, rodapés e linha final de Total Geral nativa do PDF
-                    if (
-                        "SUMÁRIO" in line_text
-                        or "RECEITA OPERACIONAL" in line_text
-                        or "TOTAL GERAL" in line_text
-                        or "ID FILE" in line_text
-                        or "HTTPS://" in line_text.lower()
-                    ):
-                        continue
+            # Processa linha por linha na ordem vertical da página
+            for top_key in sorted(lines_dict.keys()):
+                line_words = lines_dict[top_key]
+                # Ordena as palavras da esquerda para a direita (eixo X)
+                line_words.sort(key=lambda x: x["x0"])
 
-                    # Procura o token que possui o formato do ID FILE (6 dígitos com ou sem ponto)
-                    for idx, cell in enumerate(cells):
-                        match_id = re.search(r"\b(\d{3}[\.:]?\d{3})\b", cell)
+                tokens = [
+                    w["text"].replace("|", "").strip()
+                    for w in line_words
+                    if w["text"].replace("|", "").strip() != ""
+                ]
 
-                        if match_id:
-                            id_raw = match_id.group(1).replace(":", ".").strip()
-                            clean_digits = id_raw.replace(".", "")
+                line_str = " ".join(tokens).upper()
 
-                            if len(clean_digits) == 6 and clean_digits.isdigit():
-                                id_file_str = f"{clean_digits[:3]}.{clean_digits[3:]}"
-                                remaining = cells[idx + 1 :]
+                # Ignora cabeçalhos, rodapés e linha de Total do PDF
+                if (
+                    "SUMÁRIO" in line_str
+                    or "RECEITA OPERACIONAL" in line_str
+                    or "TOTAL GERAL" in line_str
+                    or "ID FILE" in line_str
+                    or "HTTPS://" in line_str.lower()
+                ):
+                    continue
 
-                                # Extrai os 4 valores monetários à direita do ID
-                                if len(remaining) >= 4:
-                                    records.append({
-                                        "ID_FILE": id_file_str,
-                                        "TOTAL_GERAL": to_float(remaining[0]),
-                                        "RECEITA_OPERACIONAL": to_float(remaining[1]),
-                                        "CUSTO_OPERACAO_RATEIO": to_float(remaining[2]),
-                                        "TOTAL_NET_PREVISTO": to_float(remaining[3]),
-                                    })
+                # Localiza o Id File dentro dos tokens da linha
+                for idx, token in enumerate(tokens):
+                    match_id = pattern_id.match(token)
+                    if match_id:
+                        clean_digits = (
+                            token.replace(".", "").replace(":", "").strip()
+                        )
+
+                        if len(clean_digits) == 6 and clean_digits.isdigit():
+                            id_file_str = (
+                                f"{clean_digits[:3]}.{clean_digits[3:]}"
+                            )
+                            remaining_tokens = tokens[idx + 1 :]
+
+                            # Filtra apenas os tokens que são valores monetários válidos
+                            money_vals = [
+                                t
+                                for t in remaining_tokens
+                                if pattern_money.match(t)
+                            ]
+
+                            if len(money_vals) >= 4:
+                                records.append({
+                                    "ID_FILE": id_file_str,
+                                    "TOTAL_GERAL": to_float(money_vals[0]),
+                                    "RECEITA_OPERACIONAL": to_float(
+                                        money_vals[1]
+                                    ),
+                                    "CUSTO_OPERACAO_RATEIO": to_float(
+                                        money_vals[2]
+                                    ),
+                                    "TOTAL_NET_PREVISTO": to_float(
+                                        money_vals[3]
+                                    ),
+                                })
                                 break
 
-            # Limpa cache para economizar memória e evitar queda no Streamlit Cloud
             page.flush_cache()
 
     df = pd.DataFrame(records)
 
     if not df.empty:
-        # Gera a linha do TOTAL GERAL somando as colunas no Python
+        # Gera o TOTAL GERAL recalculado via Python
         row_total = {
             "ID_FILE": "TOTAL GERAL",
             "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
@@ -167,7 +198,7 @@ def parse_sumario_pdfplumber(pdf_file):
     return df
 
 
-# --- PARSER 2: MODELO BROCKER / BUSTOUR DETALHADO ---
+# --- PARSER 2: BROCKER DETALHADO ---
 def parse_brocker_pdf(pdf_file):
     reader = pypdf.PdfReader(pdf_file)
     records = []
@@ -305,7 +336,7 @@ if uploaded_file is not None:
     try:
         if (
             tipo_relatorio
-            == "Sumário / Manutenção ComISSIONADA (Tabela por Id File)"
+            == "Sumário / Manutenção Comissionada (Tabela por Id File)"
         ):
             df_result = parse_sumario_pdfplumber(uploaded_file)
         else:
