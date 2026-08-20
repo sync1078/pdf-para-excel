@@ -5,20 +5,45 @@ import pypdf
 import streamlit as st
 
 st.set_page_config(
-    page_title="Conversor PDF para Excel", page_icon="📊", layout="wide"
+    page_title="Conversor de Relatórios PDF para Excel",
+    page_icon="📊",
+    layout="wide",
 )
 
-st.title("📊 Conversor de Relatórios Brocker / Bustour (PDF → Excel)")
+st.title("📊 Conversor de Relatórios (PDF → Excel)")
 st.write(
-    "Upload do relatório em PDF para gerar a planilha formatada no padrão exato do seu Banco de Dados."
+    "Faça o upload do relatório em PDF e selecione o tipo para gerar a planilha formatada."
 )
 
-uploaded_file = st.file_uploader(
-    "Arraste ou selecione o arquivo PDF do relatório", type=["pdf"]
+# 1. Seletor do modelo de relatório no menu lateral
+tipo_relatorio = st.sidebar.selectbox(
+    "Selecione o modelo do relatório:",
+    [
+        "Sumário / Manutenção Comissionada (PDF em Tabela)",
+        "Brocker / Bustour Detalhado (PDF por Cliente)",
+    ],
 )
+
+# 2. Upload do arquivo
+uploaded_file = st.file_uploader(
+    "Arraste ou selecione o arquivo PDF", type=["pdf"]
+)
+
+
+# --- FUNÇÕES UTILITÁRIAS ---
+def to_float(val_str):
+    """Converte números formatados em padrão brasileiro (ex: 1.218,00) para float."""
+    if not val_str:
+        return 0.0
+    val_clean = val_str.replace(".", "").replace(",", ".").strip()
+    try:
+        return float(val_clean)
+    except ValueError:
+        return 0.0
 
 
 def adjust_fees_to_match_target(df_input, target_fee):
+    """Ajuste fino de centavos para conciliação no Excel."""
     df = df_input.copy()
     current_sum = round(df["VALOR_FEE"].sum(), 2)
     diff = round(current_sum - target_fee, 2)
@@ -56,16 +81,19 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-def parse_brocker_pdf(pdf_file):
+# --- PARSERS DE PDF ---
+
+
+def parse_sumario_pdf(pdf_file):
+    """Parser para relatórios do tipo SUMÁRIO / MANUTENÇÃO COMISSIONADA (Tabela por Id File)."""
     reader = pypdf.PdfReader(pdf_file)
     records = []
 
-    current_file = ""
-    current_client = ""
-    current_site = ""
-
-    def to_float(val_str):
-        return float(val_str.replace(".", "").replace(",", "."))
+    # Regex para capturar linhas de dados com separadores | ou espaços
+    # Formato esperado: [Seq] | [Id File] | [Total Geral] | [Receita Operacional] | [Custo Rateio] | [Total NET]
+    pattern = re.compile(
+        r"^(?:\d+\s*\|\s*)?(\d{3}[\.:\s]?\d{3})\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)"
+    )
 
     for page in reader.pages:
         text = page.extract_text()
@@ -76,7 +104,73 @@ def parse_brocker_pdf(pdf_file):
         for line in lines:
             line_str = line.strip()
 
-            # Filtrar rodapés e cabeçalhos repetidos
+            # Descartar cabeçalhos, rodapés e totais da leitura linha a linha
+            if (
+                not line_str
+                or "SUMÁRIO" in line_str.upper()
+                or "SUMÁRIO DE" in line_str.upper()
+                or "TOTAL GERAL" in line_str.upper()
+                or "RECEITA OPERACIONAL" in line_str.upper()
+                or "ID FILE" in line_str.upper()
+                or "HTTPS://" in line_str.lower()
+            ):
+                continue
+
+            match = pattern.search(line_str)
+            if match:
+                # Normaliza o Id File removendo caracteres indesejados (como dois pontos do OCR)
+                id_file_raw = match.group(1).replace(":", ".").replace(" ", ".")
+                id_file = int(id_file_raw.replace(".", ""))
+
+                total_geral = to_float(match.group(2))
+                receita_operacional = to_float(match.group(3))
+                custo_rateio = to_float(match.group(4))
+                total_net = to_float(match.group(5))
+
+                records.append({
+                    "ID_FILE": id_file,
+                    "TOTAL_GERAL": total_geral,
+                    "RECEITA_OPERACIONAL": receita_operacional,
+                    "CUSTO_OPERACAO_RATEIO": custo_rateio,
+                    "TOTAL_NET_PREVISTO": total_net,
+                })
+
+    df = pd.DataFrame(records)
+
+    # Se registros forem encontrados, adiciona a linha de Total Geral
+    if not df.empty:
+        row_total = {
+            "ID_FILE": "TOTAL GERAL",
+            "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
+            "RECEITA_OPERACIONAL": round(df["RECEITA_OPERACIONAL"].sum(), 2),
+            "CUSTO_OPERACAO_RATEIO": round(
+                df["CUSTO_OPERACAO_RATEIO"].sum(), 2
+            ),
+            "TOTAL_NET_PREVISTO": round(df["TOTAL_NET_PREVISTO"].sum(), 2),
+        }
+        df = pd.concat([df, pd.DataFrame([row_total])], ignore_index=True)
+
+    return df
+
+
+def parse_brocker_pdf(pdf_file):
+    """Parser original para relatórios detalhados com Serviço e Cliente."""
+    reader = pypdf.PdfReader(pdf_file)
+    records = []
+
+    current_file = ""
+    current_client = ""
+    current_site = ""
+
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text:
+            continue
+
+        lines = text.split("\n")
+        for line in lines:
+            line_str = line.strip()
+
             if (
                 not line_str
                 or "FEE -" in line_str
@@ -90,7 +184,6 @@ def parse_brocker_pdf(pdf_file):
             ):
                 continue
 
-            # Captura o cabeçalho do Cliente / File
             client_match = re.search(
                 r"^(\d+)\s*[-–]?\s*(.*?)\s*\(([^\)]+)\)", line_str
             )
@@ -100,7 +193,6 @@ def parse_brocker_pdf(pdf_file):
                 current_site = client_match.group(3).strip()
                 continue
 
-            # Captura a linha do Serviço (que possui a Data DD/MM/YY)
             date_match = re.search(r"(\d{2}/\d{2}/\d{2,4})", line_str)
             if date_match and current_file:
                 data_servico = date_match.group(1)
@@ -110,7 +202,6 @@ def parse_brocker_pdf(pdf_file):
                 servico_nome = line_str[:date_start].strip()
                 resto = line_str[date_end:].strip()
 
-                # Extrai a Categoria do Serviço (após o %)
                 pct_match = re.search(r"(\d+[\.,]\d+\s*%)", resto)
                 if pct_match:
                     categoria = resto[pct_match.end() :].strip()
@@ -119,10 +210,9 @@ def parse_brocker_pdf(pdf_file):
                     categoria = ""
                     nums_part = resto
 
-                # Extrai todos os valores monetários com vírgula
-                monetaries = re.findall(r"\d+(?:\.\d{3})*,\d{2}", nums_part)
-
-                # Limpa os números monetários para isolar inteiros (ADT, CHD, INF, QTD)
+                monetaries = re.findall(
+                    r"\d+(?:\.\d{3})*,\d{2}", nums_part
+                )
                 cleaned_nums = nums_part
                 for m in monetaries:
                     cleaned_nums = cleaned_nums.replace(m, " ")
@@ -138,7 +228,9 @@ def parse_brocker_pdf(pdf_file):
                     else (adt + chd + inf)
                 )
 
-                valor_fee = to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
+                valor_fee = (
+                    to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
+                )
                 valor_venda = (
                     to_float(monetaries[1]) if len(monetaries) > 1 else 0.0
                 )
@@ -170,8 +262,6 @@ def parse_brocker_pdf(pdf_file):
     if not df.empty:
         total_venda = round(df["VALOR_VENDA"].sum(), 2)
         total_fee = round(total_venda * 0.01, 2)
-
-        # Reajuste Fino: ajusta as linhas para que a soma da coluna no Excel dê exatamente o total do rodapé
         df = adjust_fees_to_match_target(df, total_fee)
 
         row_total = {
@@ -195,16 +285,21 @@ def parse_brocker_pdf(pdf_file):
     return df
 
 
+# --- PROCESSAMENTO PRINCIPAL ---
+
 if uploaded_file is not None:
-    st.info("Processando o arquivo PDF...")
+    st.info(f"Processando arquivo no modelo **{tipo_relatorio}**...")
     try:
-        df_result = parse_brocker_pdf(uploaded_file)
+        if tipo_relatorio == "Sumário / Manutenção Comissionada (PDF em Tabela)":
+            df_result = parse_sumario_pdf(uploaded_file)
+        else:
+            df_result = parse_brocker_pdf(uploaded_file)
 
         if not df_result.empty:
             st.success(
-                f"Pronto! {len(df_result)-1} registros foram convertidos com sucesso."
+                f"Sucesso! {len(df_result)-1} registros foram convertidos."
             )
-            st.dataframe(df_result.head(20), use_container_width=True)
+            st.dataframe(df_result.head(30), use_container_width=True)
 
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
@@ -219,6 +314,6 @@ if uploaded_file is not None:
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             )
         else:
-            st.warning("Nenhum registro foi encontrado no PDF enviado.")
+            st.warning("Nenhum registro correspondente foi encontrado no PDF.")
     except Exception as e:
         st.error(f"Erro ao processar o arquivo: {e}")
