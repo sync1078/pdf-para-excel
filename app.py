@@ -1,6 +1,7 @@
 import io
 import re
 import pandas as pd
+import pdfplumber
 import pypdf
 import streamlit as st
 
@@ -84,63 +85,70 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-# --- PARSER 1: SUMÁRIO (OTIMIZADO PARA LEITURA RÁPIDA SEM ESTOURO DE MEMÓRIA) ---
-def parse_sumario_pypdf(pdf_file):
-    reader = pypdf.PdfReader(pdf_file)
+# --- PARSER 1: SUMÁRIO (EXTRAÇÃO LINHA A LINHA OTIMIZADA) ---
+def parse_sumario_pdfplumber(pdf_file):
     records = []
 
-    # Captura valores com tolerância para quebras de linha e pipes do PDF
-    pattern = re.compile(
-        r"(\d{3}[\.:]?\d{3})\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)"
+    # Regex para alinhar estritamente os campos:
+    # 1. Sequencial da margem (opcional): ex "3928"
+    # 2. ID File real (obrigatório): ex "723.176" ou "597.762"
+    # 3. Quatro colunas monetárias (obrigatórias)
+    pattern_line = re.compile(
+        r"(?:^\d+\s*\|\s*)?(\d{3}[\.:]?\d{3})\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)\s*\|\s*([\d\.,]+)"
     )
 
-    for page in reader.pages:
-        text = page.extract_text()
-        if not text:
-            continue
-
-        lines = text.split("\n")
-        for line in lines:
-            line_str = line.strip()
-
-            if (
-                not line_str
-                or "SUMÁRIO" in line_str.upper()
-                or "TOTAL GERAL" in line_str.upper()
-                or "RECEITA OPERACIONAL" in line_str.upper()
-                or "ID FILE" in line_str.upper()
-                or "HTTPS://" in line_str.lower()
-            ):
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            # Layout=True preserva os alinhamentos horizontais exatos das colunas
+            text = page.extract_text(layout=False)
+            if not text:
+                page.flush_cache()
                 continue
 
-            match = pattern.search(line_str)
-            if match:
-                id_file_raw = (
-                    match.group(1).replace(":", ".").replace(" ", ".")
-                )
+            lines = text.split("\n")
+            for line in lines:
+                line_str = line.strip()
 
-                if "." not in id_file_raw and len(id_file_raw) == 6:
-                    id_file_str = f"{id_file_raw[:3]}.{id_file_raw[3:]}"
-                else:
-                    id_file_str = id_file_raw
+                if (
+                    not line_str
+                    or "SUMÁRIO" in line_str.upper()
+                    or "TOTAL GERAL" in line_str.upper()
+                    or "RECEITA OPERACIONAL" in line_str.upper()
+                    or "ID FILE" in line_str.upper()
+                    or "HTTPS://" in line_str.lower()
+                ):
+                    continue
 
-                total_geral = to_float(match.group(2))
-                receita_op = to_float(match.group(3))
-                custo_rateio = to_float(match.group(4))
-                total_net = to_float(match.group(5))
+                match = pattern_line.search(line_str)
+                if match:
+                    id_file_raw = (
+                        match.group(1).replace(":", ".").replace(" ", ".")
+                    )
 
-                records.append({
-                    "ID_FILE": id_file_str,
-                    "TOTAL_GERAL": total_geral,
-                    "RECEITA_OPERACIONAL": receita_op,
-                    "CUSTO_OPERACAO_RATEIO": custo_rateio,
-                    "TOTAL_NET_PREVISTO": total_net,
-                })
+                    if "." not in id_file_raw and len(id_file_raw) == 6:
+                        id_file_str = f"{id_file_raw[:3]}.{id_file_raw[3:]}"
+                    else:
+                        id_file_str = id_file_raw
+
+                    total_geral = to_float(match.group(2))
+                    receita_op = to_float(match.group(3))
+                    custo_rateio = to_float(match.group(4))
+                    total_net = to_float(match.group(5))
+
+                    records.append({
+                        "ID_FILE": id_file_str,
+                        "TOTAL_GERAL": total_geral,
+                        "RECEITA_OPERACIONAL": receita_op,
+                        "CUSTO_OPERACAO_RATEIO": custo_rateio,
+                        "TOTAL_NET_PREVISTO": total_net,
+                    })
+
+            # Libera a memória da página processada para evitar crash (Error Oh No)
+            page.flush_cache()
 
     df = pd.DataFrame(records)
 
     if not df.empty:
-        # Recalcula o Total Geral com precisão decimal
         row_total = {
             "ID_FILE": "TOTAL GERAL",
             "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
@@ -155,7 +163,7 @@ def parse_sumario_pypdf(pdf_file):
     return df
 
 
-# --- PARSER 2: MODELO BROCKER / BUSTOUR DETALHADO ---
+# --- PARSER 2: BROCKER DETALHADO ---
 def parse_brocker_pdf(pdf_file):
     reader = pypdf.PdfReader(pdf_file)
     records = []
@@ -295,7 +303,7 @@ if uploaded_file is not None:
             tipo_relatorio
             == "Sumário / Manutenção Comissionada (Tabela por Id File)"
         ):
-            df_result = parse_sumario_pypdf(uploaded_file)
+            df_result = parse_sumario_pdfplumber(uploaded_file)
         else:
             df_result = parse_brocker_pdf(uploaded_file)
 
