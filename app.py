@@ -20,7 +20,7 @@ st.write(
 tipo_relatorio = st.sidebar.selectbox(
     "Selecione o modelo do relatório:",
     [
-        "Sumário / Manutenção ComISSIONADA (Tabela por Id File)",
+        "Sumário / Manutenção Comissionada (Tabela por Id File)",
         "Brocker / Bustour Detalhado (PDF por Cliente)",
     ],
 )
@@ -88,20 +88,20 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-# --- PARSER 1: SUMÁRIO / MANUTENÇÃO COMISSIONADA (LEITURA DIRETA DE TEXTO) ---
+# --- PARSER 1: SUMÁRIO / MANUTENÇÃO COMISSIONADA (LEITURA DIRETA DE TEXTO OTIMIZADA) ---
 def parse_sumario_pdfplumber(pdf_file):
     records = []
 
-    # Captura linhas contendo: [Id File] + 4 valores monetários
-    # Exemplo no PDF: "1 | 597.762 | 88,00 | 88,00 | 0,00 | 0,00"
+    # Regex que aceita número da linha opcional, ID FILE com ou sem ponto, e os 4 valores
     pattern = re.compile(
-        r"(\d{3}[\.:]?\d{3})\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)"
+        r"(?:^\d+\s*\|?\s*)?(\d{3}[\.:]?\d{3})\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)"
     )
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
             text = page.extract_text()
             if not text:
+                page.flush_cache()
                 continue
 
             lines = text.split("\n")
@@ -142,6 +142,9 @@ def parse_sumario_pdfplumber(pdf_file):
                         "CUSTO_OPERACAO_RATEIO": custo_rateio,
                         "TOTAL_NET_PREVISTO": total_net,
                     })
+
+            # Libera memória a cada página processada
+            page.flush_cache()
 
     df = pd.DataFrame(records)
 
