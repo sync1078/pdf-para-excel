@@ -47,33 +47,51 @@ def to_float(val_str):
 def parse_sumario_pdfplumber(pdf_file):
     records = []
 
+    # Regex ajustada para capturar o Id File mesmo sem o ponto (ex: 597.762 ou 597762)
+    pattern_id = re.compile(r"\b(\d{3}[\.:]?\d{3})\b")
+
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            # Extrai tabelas usando detecção visual do PDF
             tables = page.extract_tables()
 
             for table in tables:
                 for row in table:
-                    # Limpa espaços em branco e elementos nulos da linha
                     row_clean = [
                         str(cell).strip() if cell is not None else ""
                         for cell in row
                     ]
-
-                    # Filtra apenas o conteúdo relevante, descartando strings vazias
                     cells = [c for c in row_clean if c != ""]
 
-                    # Procura por linhas que contenham um Id File no formato (ex: 597.762 ou 609.176)
+                    # Descartar cabeçalhos, rodapés e a linha final do próprio PDF
+                    row_text = " ".join(cells).upper()
+                    if (
+                        "SUMÁRIO" in row_text
+                        "TOTAL GERAL" in row_text
+                        or "RECEITA OPERACIONAL" in row_text
+                        or "ID FILE" in row_text
+                    ):
+                        continue
+
                     for idx, cell in enumerate(cells):
-                        match_id = re.search(r"\b(\d{3}[\.:]\d{3})\b", cell)
+                        match_id = pattern_id.search(cell)
 
                         if match_id:
-                            # Garante que existem colunas numéricas suficientes após o ID
-                            id_file_raw = match_id.group(1).replace(":", ".")
-                            id_file = int(id_file_raw.replace(".", ""))
+                            id_file_raw = (
+                                match_id.group(1)
+                                .replace(":", ".")
+                                .replace(" ", ".")
+                            )
+                            # Se o ID não tiver ponto, formata para manter padrão visual
+                            if "." not in id_file_raw and len(id_file_raw) == 6:
+                                id_file_str = (
+                                    f"{id_file_raw[:3]}.{id_file_raw[3:]}"
+                                )
+                            else:
+                                id_file_str = id_file_raw
 
-                            # Pega os próximos 4 valores monetários da linha
                             remaining_cells = cells[idx + 1 :]
+
+                            # Garante a extração dos 4 valores monetários
                             if len(remaining_cells) >= 4:
                                 total_geral = to_float(remaining_cells[0])
                                 receita_op = to_float(remaining_cells[1])
@@ -81,7 +99,7 @@ def parse_sumario_pdfplumber(pdf_file):
                                 total_net = to_float(remaining_cells[3])
 
                                 records.append({
-                                    "ID_FILE": id_file,
+                                    "ID_FILE": id_file_str,
                                     "TOTAL_GERAL": total_geral,
                                     "RECEITA_OPERACIONAL": receita_op,
                                     "CUSTO_OPERACAO_RATEIO": custo_rateio,
@@ -91,11 +109,8 @@ def parse_sumario_pdfplumber(pdf_file):
 
     df = pd.DataFrame(records)
 
-    # Remove duplicatas se o PDF tiver releitura de cabeçalhos
     if not df.empty:
-        df.drop_duplicates(subset=["ID_FILE"], inplace=True)
-
-        # Adiciona a linha de Total Geral no final da planilha
+        # ATENÇÃO: drop_duplicates foi removido para não apagar vendas do mesmo File
         row_total = {
             "ID_FILE": "TOTAL GERAL",
             "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
