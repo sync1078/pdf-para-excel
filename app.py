@@ -20,7 +20,7 @@ st.write(
 tipo_relatorio = st.sidebar.selectbox(
     "Selecione o modelo do relatório:",
     [
-        "Sumário / Manutenção Comissionada (Tabela por Id File)",
+        "Sumário / Manutenção ComISSIONADA (Tabela por Id File)",
         "Brocker / Bustour Detalhado (PDF por Cliente)",
     ],
 )
@@ -88,75 +88,65 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-# --- PARSER 1: SUMÁRIO / MANUTENÇÃO COMISSIONADA (PDFPLUMBER) ---
+# --- PARSER 1: SUMÁRIO / MANUTENÇÃO COMISSIONADA (LEITURA DIRETA DE TEXTO) ---
 def parse_sumario_pdfplumber(pdf_file):
     records = []
 
-    # Regex para identificar o ID File (ex: 597.762, 609.176)
-    pattern_id = re.compile(r"\b(\d{3}[\.:]?\d{3})\b")
+    # Captura linhas contendo: [Id File] + 4 valores monetários
+    # Exemplo no PDF: "1 | 597.762 | 88,00 | 88,00 | 0,00 | 0,00"
+    pattern = re.compile(
+        r"(\d{3}[\.:]?\d{3})\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)\s*\|?\s*([\d\.,]+)"
+    )
 
     with pdfplumber.open(pdf_file) as pdf:
         for page in pdf.pages:
-            tables = page.extract_tables()
+            text = page.extract_text()
+            if not text:
+                continue
 
-            for table in tables:
-                for row in table:
-                    row_clean = [
-                        str(cell).strip() if cell is not None else ""
-                        for cell in row
-                    ]
-                    cells = [c for c in row_clean if c != ""]
+            lines = text.split("\n")
+            for line in lines:
+                line_str = line.strip()
 
-                    row_text = " ".join(cells).upper()
+                # Ignorar cabeçalhos e a linha final de total nativa do PDF
+                if (
+                    not line_str
+                    or "SUMÁRIO" in line_str.upper()
+                    or "TOTAL GERAL" in line_str.upper()
+                    or "RECEITA OPERACIONAL" in line_str.upper()
+                    or "ID FILE" in line_str.upper()
+                    or "HTTPS://" in line_str.lower()
+                ):
+                    continue
 
-                    # Descarta linhas de cabeçalho, rodapé ou linha final original do PDF
-                    if (
-                        "SUMÁRIO" in row_text
-                        or "TOTAL GERAL" in row_text
-                        or "RECEITA OPERACIONAL" in row_text
-                        or "ID FILE" in row_text
-                    ):
-                        continue
+                match = pattern.search(line_str)
+                if match:
+                    id_file_raw = (
+                        match.group(1).replace(":", ".").replace(" ", ".")
+                    )
 
-                    for idx, cell in enumerate(cells):
-                        match_id = pattern_id.search(cell)
+                    if "." not in id_file_raw and len(id_file_raw) == 6:
+                        id_file_str = f"{id_file_raw[:3]}.{id_file_raw[3:]}"
+                    else:
+                        id_file_str = id_file_raw
 
-                        if match_id:
-                            id_file_raw = (
-                                match_id.group(1)
-                                .replace(":", ".")
-                                .replace(" ", ".")
-                            )
+                    total_geral = to_float(match.group(2))
+                    receita_op = to_float(match.group(3))
+                    custo_rateio = to_float(match.group(4))
+                    total_net = to_float(match.group(5))
 
-                            if "." not in id_file_raw and len(id_file_raw) == 6:
-                                id_file_str = (
-                                    f"{id_file_raw[:3]}.{id_file_raw[3:]}"
-                                )
-                            else:
-                                id_file_str = id_file_raw
-
-                            remaining_cells = cells[idx + 1 :]
-
-                            # Pega os 4 valores monetários sequenciais
-                            if len(remaining_cells) >= 4:
-                                total_geral = to_float(remaining_cells[0])
-                                receita_op = to_float(remaining_cells[1])
-                                custo_rateio = to_float(remaining_cells[2])
-                                total_net = to_float(remaining_cells[3])
-
-                                records.append({
-                                    "ID_FILE": id_file_str,
-                                    "TOTAL_GERAL": total_geral,
-                                    "RECEITA_OPERACIONAL": receita_op,
-                                    "CUSTO_OPERACAO_RATEIO": custo_rateio,
-                                    "TOTAL_NET_PREVISTO": total_net,
-                                })
-                            break
+                    records.append({
+                        "ID_FILE": id_file_str,
+                        "TOTAL_GERAL": total_geral,
+                        "RECEITA_OPERACIONAL": receita_op,
+                        "CUSTO_OPERACAO_RATEIO": custo_rateio,
+                        "TOTAL_NET_PREVISTO": total_net,
+                    })
 
     df = pd.DataFrame(records)
 
     if not df.empty:
-        # Linha do TOTAL GERAL calculado pelo Python
+        # Linha do TOTAL GERAL recalculado no Excel
         row_total = {
             "ID_FILE": "TOTAL GERAL",
             "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
@@ -309,7 +299,7 @@ if uploaded_file is not None:
     try:
         if (
             tipo_relatorio
-            == "Sumário / Manutenção Comissionada (Tabela por Id File)"
+            == "Sumário / Manutenção ComISSIONADA (Tabela por Id File)"
         ):
             df_result = parse_sumario_pdfplumber(uploaded_file)
         else:
