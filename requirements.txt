@@ -2,3 +2,4 @@ streamlit
 pypdf
 pandas
 openpyxl
+pdfplumber
