@@ -1,53 +1,26 @@
 import io
 import re
 import pandas as pd
-import pdfplumber
 import pypdf
 import streamlit as st
 
 st.set_page_config(
-    page_title="Conversor de Relatórios PDF para Excel",
-    page_icon="📊",
-    layout="wide",
+    page_title="Conversor PDF para Excel PRO", page_icon="📊", layout="wide"
 )
 
 st.title("📊 Conversor de Relatórios (PDF → Excel)")
 st.write(
-    "Faça o upload do relatório em PDF e selecione o tipo para gerar a planilha formatada."
+    "Upload de relatórios em PDF (Detalhados, Sumários por Categoria ou Sumários por Cliente) para gerar planilhas formatadas para Banco de Dados."
 )
 
-tipo_relatorio = st.sidebar.selectbox(
-    "Selecione o modelo do relatório:",
-    [
-        "Sumário / Manutenção Comissionada (Tabela por Id File)",
-        "Brocker / Bustour Detalhado (PDF por Cliente)",
-    ],
+uploaded_files = st.file_uploader(
+    "Arraste ou selecione um ou mais arquivos PDF dos relatórios",
+    type=["pdf"],
+    accept_multiple_files=True,
 )
-
-uploaded_file = st.file_uploader(
-    "Arraste ou selecione o arquivo PDF", type=["pdf"]
-)
-
-
-def to_float(val_str):
-    """Converte valores no padrão brasileiro (1.218,00 ou 88,00) para float."""
-    if not val_str or str(val_str).strip() == "":
-        return 0.0
-    clean_str = (
-        str(val_str)
-        .replace(".", "")
-        .replace(",", ".")
-        .replace(":", ".")
-        .strip()
-    )
-    try:
-        return float(clean_str)
-    except ValueError:
-        return 0.0
 
 
 def adjust_fees_to_match_target(df_input, target_fee):
-    """Ajuste fino de centavos para conciliação no Excel."""
     df = df_input.copy()
     current_sum = round(df["VALOR_FEE"].sum(), 2)
     diff = round(current_sum - target_fee, 2)
@@ -85,127 +58,151 @@ def adjust_fees_to_match_target(df_input, target_fee):
     return df
 
 
-# --- PARSER 1: SUMÁRIO (EXTRAÇÃO VIA PALAVRAS E POSICIONAMENTO) ---
-def parse_sumario_pdfplumber(pdf_file):
+def parse_elotour_client_pdf(reader):
     records = []
+    current_cliente = "INDEFINIDO"
 
-    # Regex para identificar ID FILE com 6 dígitos (ex: 597.762, 609.176, 679:040)
-    pattern_id = re.compile(r"^(\d{3}[\.:]?\d{3})$")
-    # Regex para identificar números monetários (ex: 1.218,00 ou 88,00 ou 0,00)
-    pattern_money = re.compile(r"^\d+(?:\.\d{3})*,\d{2}$")
+    def to_float(val_str):
+        return float(val_str.replace(".", "").replace(",", "."))
 
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            words = page.extract_words()
-            if not words:
-                page.flush_cache()
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text:
+            continue
+
+        lines = text.split("\n")
+        for line in lines:
+            line_str = line.strip()
+
+            if (
+                not line_str
+                or "SUMÁRIO DE" in line_str
+                or "Sumário de" in line_str
+                or "Cliente" in line_str
+                or "Total Geral" in line_str
+                or "https://" in line_str
+                or re.match(r"^\d{2}/\d{2}/\d{4}", line_str)
+            ):
                 continue
 
-            # Agrupa as palavras da página pelo eixo Y (mesma linha visual)
-            lines_dict = {}
-            for w in words:
-                top_key = round(w["top"], 1)
-                # Tolera pequenas variações de alinhamento vertical
-                matched_key = None
-                for k in lines_dict.keys():
-                    if abs(k - top_key) <= 3:
-                        matched_key = k
-                        break
+            file_match = re.search(
+                r"^\d+\s*(.*?)\s*(\d{3}\.\d{3})\s+([\d\.\,]+)\s+([\d\.\,]+)\s+([\d\.\,]+)",
+                line_str,
+            )
+            if file_match:
+                cliente_opt = file_match.group(1).strip()
+                if cliente_opt and not cliente_opt.isdigit():
+                    current_cliente = cliente_opt
 
-                if matched_key is None:
-                    lines_dict[top_key] = [w]
-                else:
-                    lines_dict[matched_key].append(w)
+                file_id = file_match.group(2).replace(".", "")
+                tot_geral = to_float(file_match.group(3))
+                rec_oper = to_float(file_match.group(4))
+                custo_op = to_float(file_match.group(5))
 
-            # Processa linha por linha na ordem vertical da página
-            for top_key in sorted(lines_dict.keys()):
-                line_words = lines_dict[top_key]
-                # Ordena as palavras da esquerda para a direita (eixo X)
-                line_words.sort(key=lambda x: x["x0"])
+                records.append({
+                    "CLIENTE": current_cliente,
+                    "FILE": int(file_id) if file_id.isdigit() else file_id,
+                    "TOTAL_GERAL": tot_geral,
+                    "RECEITA_OPERACIONAL": rec_oper,
+                    "CUSTO_OPERACAO_RATEIO": custo_op,
+                })
+                continue
 
-                tokens = [
-                    w["text"].replace("|", "").strip()
-                    for w in line_words
-                    if w["text"].replace("|", "").strip() != ""
-                ]
-
-                line_str = " ".join(tokens).upper()
-
-                # Ignora cabeçalhos, rodapés e linha de Total do PDF
-                if (
-                    "SUMÁRIO" in line_str
-                    or "RECEITA OPERACIONAL" in line_str
-                    or "TOTAL GERAL" in line_str
-                    or "ID FILE" in line_str
-                    or "HTTPS://" in line_str.lower()
-                ):
-                    continue
-
-                # Localiza o Id File dentro dos tokens da linha
-                for idx, token in enumerate(tokens):
-                    match_id = pattern_id.match(token)
-                    if match_id:
-                        clean_digits = (
-                            token.replace(".", "").replace(":", "").strip()
-                        )
-
-                        if len(clean_digits) == 6 and clean_digits.isdigit():
-                            id_file_str = (
-                                f"{clean_digits[:3]}.{clean_digits[3:]}"
-                            )
-                            remaining_tokens = tokens[idx + 1 :]
-
-                            # Filtra apenas os tokens que são valores monetários válidos
-                            money_vals = [
-                                t
-                                for t in remaining_tokens
-                                if pattern_money.match(t)
-                            ]
-
-                            if len(money_vals) >= 4:
-                                records.append({
-                                    "ID_FILE": id_file_str,
-                                    "TOTAL_GERAL": to_float(money_vals[0]),
-                                    "RECEITA_OPERACIONAL": to_float(
-                                        money_vals[1]
-                                    ),
-                                    "CUSTO_OPERACAO_RATEIO": to_float(
-                                        money_vals[2]
-                                    ),
-                                    "TOTAL_NET_PREVISTO": to_float(
-                                        money_vals[3]
-                                    ),
-                                })
-                                break
-
-            page.flush_cache()
+            pax_match = re.search(
+                r"^\d+\s*([A-Z0-9\s\-\/\&\.\(\)]+?)\s+[\d\.\,]+", line_str
+            )
+            if pax_match:
+                possible_client = pax_match.group(1).strip()
+                if possible_client and not possible_client.isdigit():
+                    current_cliente = possible_client
 
     df = pd.DataFrame(records)
-
     if not df.empty:
-        # Gera o TOTAL GERAL recalculado via Python
+        tot_geral_soma = round(df["TOTAL_GERAL"].sum(), 2)
+        rec_oper_soma = round(df["RECEITA_OPERACIONAL"].sum(), 2)
+        custo_op_soma = round(df["CUSTO_OPERACAO_RATEIO"].sum(), 2)
+
         row_total = {
-            "ID_FILE": "TOTAL GERAL",
-            "TOTAL_GERAL": round(df["TOTAL_GERAL"].sum(), 2),
-            "RECEITA_OPERACIONAL": round(df["RECEITA_OPERACIONAL"].sum(), 2),
-            "CUSTO_OPERACAO_RATEIO": round(
-                df["CUSTO_OPERACAO_RATEIO"].sum(), 2
-            ),
-            "TOTAL_NET_PREVISTO": round(df["TOTAL_NET_PREVISTO"].sum(), 2),
+            "CLIENTE": "TOTAL GERAL",
+            "FILE": None,
+            "TOTAL_GERAL": tot_geral_soma,
+            "RECEITA_OPERACIONAL": rec_oper_soma,
+            "CUSTO_OPERACAO_RATEIO": custo_op_soma,
         }
         df = pd.concat([df, pd.DataFrame([row_total])], ignore_index=True)
 
     return df
 
 
-# --- PARSER 2: BROCKER DETALHADO ---
-def parse_brocker_pdf(pdf_file):
-    reader = pypdf.PdfReader(pdf_file)
+def parse_managetour_summary_pdf(reader):
+    records = []
+    current_category = "INDEFINIDO"
+
+    def to_float(val_str):
+        return float(val_str.replace(".", "").replace(",", "."))
+
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text:
+            continue
+
+        lines = text.split("\n")
+        for line in lines:
+            line_str = line.strip()
+
+            if (
+                not line_str
+                or "SUMÁRIO DE" in line_str
+                or "Nome Categoria" in line_str
+                or "Total Geral" in line_str
+                or line_str.isdigit()
+            ):
+                continue
+
+            if re.match(r"^[A-ZÁÉÍÓÚÂÊÔÃÕÇ\s]{3,}$", line_str) and not re.search(
+                r"\d", line_str
+            ):
+                current_category = line_str.strip()
+                continue
+
+            file_match = re.search(
+                r"(\d{3}\.\d{3}|\d{6})\s+([\d\.\,]+)", line_str
+            )
+            if file_match:
+                file_id = file_match.group(1).replace(".", "")
+                valor_str = file_match.group(2)
+                try:
+                    total_val = to_float(valor_str)
+                    records.append({
+                        "CATEGORIA": current_category,
+                        "FILE": int(file_id) if file_id.isdigit() else file_id,
+                        "TOTAL_GERAL": total_val,
+                    })
+                except:
+                    pass
+
+    df = pd.DataFrame(records)
+    if not df.empty:
+        total_soma = round(df["TOTAL_GERAL"].sum(), 2)
+        row_total = {
+            "CATEGORIA": "TOTAL GERAL",
+            "FILE": None,
+            "TOTAL_GERAL": total_soma,
+        }
+        df = pd.concat([df, pd.DataFrame([row_total])], ignore_index=True)
+
+    return df
+
+
+def parse_brocker_pdf(reader):
     records = []
 
     current_file = ""
     current_client = ""
     current_site = ""
+
+    def to_float(val_str):
+        return float(val_str.replace(".", "").replace(",", "."))
 
     for page in reader.pages:
         text = page.extract_text()
@@ -255,9 +252,8 @@ def parse_brocker_pdf(pdf_file):
                     categoria = ""
                     nums_part = resto
 
-                monetaries = re.findall(
-                    r"\d+(?:\.\d{3})*,\d{2}", nums_part
-                )
+                monetaries = re.findall(r"\d+(?:\.\d{3})*,\d{2}", nums_part)
+
                 cleaned_nums = nums_part
                 for m in monetaries:
                     cleaned_nums = cleaned_nums.replace(m, " ")
@@ -273,9 +269,7 @@ def parse_brocker_pdf(pdf_file):
                     else (adt + chd + inf)
                 )
 
-                valor_fee = (
-                    to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
-                )
+                valor_fee = to_float(monetaries[0]) if len(monetaries) > 0 else 0.0
                 valor_venda = (
                     to_float(monetaries[1]) if len(monetaries) > 1 else 0.0
                 )
@@ -309,6 +303,84 @@ def parse_brocker_pdf(pdf_file):
         total_fee = round(total_venda * 0.01, 2)
         df = adjust_fees_to_match_target(df, total_fee)
 
+    return df
+
+
+def process_pdf_file(pdf_file):
+    reader = pypdf.PdfReader(pdf_file)
+    first_page_text = reader.pages[0].extract_text() if reader.pages else ""
+
+    if "Receita Operacional" in first_page_text or "Custo Operacao" in first_page_text:
+        df = parse_elotour_client_pdf(reader)
+        pdf_type = "elotour_cliente"
+    elif "SUMÁRIO DE" in first_page_text or "Total Geral (Soma)" in first_page_text:
+        df = parse_managetour_summary_pdf(reader)
+        pdf_type = "sumario"
+    else:
+        df = parse_brocker_pdf(reader)
+        pdf_type = "detalhado"
+
+    return df, pdf_type
+
+
+if uploaded_files:
+    all_dfs_detalhado = []
+    all_dfs_sumario = []
+    all_dfs_elotour = []
+
+    with st.spinner("Processando arquivos PDF..."):
+        for file in uploaded_files:
+            df_result, p_type = process_pdf_file(file)
+            if not df_result.empty:
+                if p_type == "detalhado":
+                    df_clean = df_result[df_result["FILE"] != "TOTAL"]
+                    all_dfs_detalhado.append(df_clean)
+                elif p_type == "sumario":
+                    df_clean = df_result[df_result["CATEGORIA"] != "TOTAL GERAL"]
+                    all_dfs_sumario.append(df_clean)
+                elif p_type == "elotour_cliente":
+                    df_clean = df_result[df_result["CLIENTE"] != "TOTAL GERAL"]
+                    all_dfs_elotour.append(df_clean)
+
+    # 1. Exibição de Relatórios Detalhados
+    if all_dfs_detalhado:
+        df_full_det = pd.concat(all_dfs_detalhado, ignore_index=True)
+
+        st.markdown("---")
+        st.subheader("📈 Painel Geral de Vendas (Relatórios Detalhados)")
+
+        col1, col2, col3, col4 = st.columns(4)
+        total_venda_geral = round(df_full_det["VALOR_VENDA"].sum(), 2)
+        total_fee_geral = round(total_venda_geral * 0.01, 2)
+        total_passag = df_full_det["QTD"].sum()
+        total_files = df_full_det["FILE"].nunique()
+
+        col1.metric("Total de Vendas", f"R$ {total_venda_geral:,.2f}")
+        col2.metric("Total Fee (1%)", f"R$ {total_fee_geral:,.2f}")
+        col3.metric("Total de Passageiros", f"{int(total_passag):,}")
+        col4.metric("Qtd. de Vouchers/Files", f"{total_files:,}")
+
+        col_l, col_r = st.columns(2)
+        with col_l:
+            st.markdown("**Vendas por Canal de Origem**")
+            st.bar_chart(
+                df_full_det.groupby("SITE_ORIGEM")["VALOR_VENDA"]
+                .sum()
+                .sort_values(ascending=False)
+            )
+        with col_r:
+            st.markdown("**Top 10 Serviços Mais Vendidos (R$)**")
+            st.bar_chart(
+                df_full_det.groupby("SERVICO")["VALOR_VENDA"]
+                .sum()
+                .sort_values(ascending=False)
+                .head(10)
+            )
+
+        df_full_det = adjust_fees_to_match_target(
+            df_full_det, total_fee_geral
+        )
+
         row_total = {
             "FILE": "TOTAL",
             "NOME_CLIENTE": None,
@@ -322,45 +394,98 @@ def parse_brocker_pdf(pdf_file):
             "QTD": None,
             "VOUCHER_RECIBO": None,
             "TARIFA": None,
-            "VALOR_VENDA": total_venda,
-            "VALOR_FEE": total_fee,
+            "VALOR_VENDA": total_venda_geral,
+            "VALOR_FEE": total_fee_geral,
         }
-        df = pd.concat([df, pd.DataFrame([row_total])], ignore_index=True)
+        df_export_det = pd.concat(
+            [df_full_det, pd.DataFrame([row_total])], ignore_index=True
+        )
 
-    return df
-
-
-# --- PROCESSAMENTO STREAMLIT ---
-if uploaded_file is not None:
-    st.info(f"Processando arquivo no modelo **{tipo_relatorio}**...")
-    try:
-        if (
-            tipo_relatorio
-            == "Sumário / Manutenção Comissionada (Tabela por Id File)"
-        ):
-            df_result = parse_sumario_pdfplumber(uploaded_file)
-        else:
-            df_result = parse_brocker_pdf(uploaded_file)
-
-        if not df_result.empty:
-            st.success(
-                f"Sucesso! {len(df_result)-1} registros foram convertidos."
+        buffer_det = io.BytesIO()
+        with pd.ExcelWriter(buffer_det, engine="openpyxl") as writer:
+            df_export_det.to_excel(
+                writer, index=False, sheet_name="Dados_Detalhados"
             )
-            st.dataframe(df_result, use_container_width=True)
 
-            buffer = io.BytesIO()
-            with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-                df_result.to_excel(
-                    writer, index=False, sheet_name="Dados_Convertidos"
-                )
+        st.download_button(
+            label="📥 Baixar Planilha Excel Detalhada (.xlsx)",
+            data=buffer_det.getvalue(),
+            file_name="Relatorio_Detalhado_Convertido.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
-            st.download_button(
-                label="📥 Baixar Planilha Excel (.xlsx)",
-                data=buffer.getvalue(),
-                file_name="Relatorio_Convertido.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    # 2. Exibição de Relatórios EloTour (Sumário por Cliente)
+    if all_dfs_elotour:
+        df_full_elo = pd.concat(all_dfs_elotour, ignore_index=True)
+
+        st.markdown("---")
+        st.subheader("🏢 Relatório Sumário por Cliente (EloTour / ManageTour)")
+
+        tot_g = round(df_full_elo["TOTAL_GERAL"].sum(), 2)
+        rec_o = round(df_full_elo["RECEITA_OPERACIONAL"].sum(), 2)
+        cus_o = round(df_full_elo["CUSTO_OPERACAO_RATEIO"].sum(), 2)
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Total Geral", f"R$ {tot_g:,.2f}")
+        c2.metric("Receita Operacional", f"R$ {rec_o:,.2f}")
+        c3.metric("Custo Operação Rateio", f"R$ {cus_o:,.2f}")
+
+        row_total_elo = {
+            "CLIENTE": "TOTAL GERAL",
+            "FILE": None,
+            "TOTAL_GERAL": tot_g,
+            "RECEITA_OPERACIONAL": rec_o,
+            "CUSTO_OPERACAO_RATEIO": cus_o,
+        }
+        df_export_elo = pd.concat(
+            [df_full_elo, pd.DataFrame([row_total_elo])], ignore_index=True
+        )
+
+        st.dataframe(df_export_elo, use_container_width=True)
+
+        buffer_elo = io.BytesIO()
+        with pd.ExcelWriter(buffer_elo, engine="openpyxl") as writer:
+            df_export_elo.to_excel(
+                writer, index=False, sheet_name="Sumario_Cliente_EloTour"
             )
-        else:
-            st.warning("Nenhum registro correspondente foi encontrado no PDF.")
-    except Exception as e:
-        st.error(f"Erro ao processar o arquivo: {e}")
+
+        st.download_button(
+            label="📥 Baixar Planilha Excel EloTour (.xlsx)",
+            data=buffer_elo.getvalue(),
+            file_name="Relatorio_EloTour_Cliente.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+
+    # 3. Exibição de Relatórios de Sumário por Categoria
+    if all_dfs_sumario:
+        df_full_sum = pd.concat(all_dfs_sumario, ignore_index=True)
+
+        st.markdown("---")
+        st.subheader("📋 Relatório Sumário por Categoria (ManageTour)")
+
+        total_sumario = round(df_full_sum["TOTAL_GERAL"].sum(), 2)
+        st.metric("Total Geral Sumário", f"R$ {total_sumario:,.2f}")
+
+        row_total_sum = {
+            "CATEGORIA": "TOTAL GERAL",
+            "FILE": None,
+            "TOTAL_GERAL": total_sumario,
+        }
+        df_export_sum = pd.concat(
+            [df_full_sum, pd.DataFrame([row_total_sum])], ignore_index=True
+        )
+
+        st.dataframe(df_export_sum, use_container_width=True)
+
+        buffer_sum = io.BytesIO()
+        with pd.ExcelWriter(buffer_sum, engine="openpyxl") as writer:
+            df_export_sum.to_excel(
+                writer, index=False, sheet_name="Sumario_ManageTour"
+            )
+
+        st.download_button(
+            label="📥 Baixar Planilha Excel de Sumário (.xlsx)",
+            data=buffer_sum.getvalue(),
+            file_name="Relatorio_Sumario_ManageTour.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
