@@ -1,119 +1,133 @@
-import streamlit as st
-import pdfplumber
-import pandas as pd
 import io
 import re
+import pandas as pd
+import pypdf
+import streamlit as st
 
-st.set_page_config(page_title="Conversor PDF para Excel - Brocker", layout="centered")
+st.set_page_config(
+    page_title="Conversor ManageTour File → Excel",
+    page_icon="📊",
+    layout="wide",
+)
 
-def clean_brazilian_currency(value):
-    """Converte strings de moeda no formato brasileiro (1.000,00) para float (1000.00)."""
-    if pd.isna(value) or value is None or str(value).strip() == "":
-        return 0.0
-    val_str = str(value).strip()
-    
-    # Se não houver números, retorna 0
-    if not re.search(r'\d', val_str):
-        return 0.0
-        
-    # Remove pontos de milhar e troca vírgula por ponto
-    val_str = val_str.replace('.', '').replace(',', '.')
-    try:
-        return float(val_str)
-    except ValueError:
-        return 0.0
+st.title("📊 Conversor ManageTour (Sumário por File)")
+st.write(
+    "Upload de relatórios PDF em formato de Sumário por File para extrair exclusivamente as colunas: "
+    "**ID_FILE**, **TOTAL_GERAL**, **RECEITA_OPERACIONAL**, **CUSTO_OPERACAO_RATEIO** e **TOTAL_NET_PREVISTO**."
+)
 
-def process_pdf(pdf_file):
-    all_rows = []
-    
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            # Extrai a tabela da página
-            table = page.extract_table()
-            
-            if table:
-                for row in table:
-                    # Remove quebras de linha indesejadas dentro das células
-                    cleaned_row = [str(cell).replace('\n', ' ').strip() if cell else "" for cell in row]
-                    
-                    # Transforma a linha em uma string para verificar lixos de paginação
-                    row_text = " ".join(cleaned_row).lower()
-                    
-                    # Ignorar linhas de cabeçalho repetido, datas, URLs e paginação do PDF
-                    if ("sumário" in row_text or 
-                        "https://" in row_text or 
-                        "receita operacional" in row_text or
-                        "total geral" in row_text or
-                        not any(char.isdigit() for char in row_text)): # Pula se não tiver nenhum número
-                        continue
-                    
-                    # Filtra colunas totalmente vazias criadas por artefatos do PDF
-                    cleaned_row = [cell for cell in cleaned_row if cell != ""]
-                    
-                    # Se a linha tiver os 6 dados principais (Id, File, Total Geral, Receita, Custo, Total Net)
-                    if len(cleaned_row) >= 6:
-                        # Pegamos os 6 primeiros itens caso o PDF crie colunas extras fantasmas
-                        all_rows.append(cleaned_row[:6])
+uploaded_files = st.file_uploader(
+    "Arraste ou selecione um ou mais arquivos PDF do relatório por File",
+    type=["pdf"],
+    accept_multiple_files=True,
+)
 
-    # Criar o DataFrame com os cabeçalhos baseados no seu arquivo
-    columns = [
-        "Índice", 
-        "Id File", 
-        "Total Geral", 
-        "Receita Operacional", 
-        "Custo Operacao Rateio", 
-        "Total NET - Previsto"
-    ]
-    
-    df = pd.DataFrame(all_rows, columns=columns)
-    
-    # Limpar a coluna 'Índice' e 'Id File' (manter como string ou converter para int)
-    df['Índice'] = pd.to_numeric(df['Índice'], errors='coerce')
-    df['Id File'] = df['Id File'].astype(str)
-    
-    # Remover linhas onde o Índice falhou em ser número (linhas sujas que passaram pelo filtro)
-    df = df.dropna(subset=['Índice'])
-    
-    # Converter as colunas financeiras
-    financial_cols = ["Total Geral", "Receita Operacional", "Custo Operacao Rateio", "Total NET - Previsto"]
-    for col in financial_cols:
-        df[col] = df[col].apply(clean_brazilian_currency)
-        
-    return df
 
-# --- Interface do Streamlit ---
-st.title("📄 Conversor de PDF para Excel")
-st.write("Faça o upload do arquivo de comissionamento (ex: *Brocker - Manutenção Comissionada ManageTour - Agosto-2026 - File.pdf*).")
+def parse_managetour_file_pdf(pdf_file):
+    reader = pypdf.PdfReader(pdf_file)
+    records = []
 
-uploaded_file = st.file_uploader("Escolha um arquivo PDF", type=["pdf"])
+    def to_float(val_str):
+        return float(val_str.replace(".", "").replace(",", "."))
 
-if uploaded_file is not None:
-    st.info("Processando o PDF... Isso pode levar alguns segundos dependendo do tamanho (ex: 227 páginas).")
-    
-    try:
-        # Extrai os dados
-        df = process_pdf(uploaded_file)
-        
-        st.success(f"Extração concluída! Encontrados {len(df)} registros.")
-        
-        # Mostra uma prévia dos dados
-        st.write("Prévia dos dados:")
-        st.dataframe(df.head(10))
-        
-        # Converte para Excel em memória
-        output = io.BytesIO()
-        with pd.ExcelWriter(output, engine='openpyxl') as writer:
-            df.to_excel(writer, index=False, sheet_name='Comissionamento')
-        
-        excel_data = output.getvalue()
-        
-        # Botão de download
-        st.download_button(
-            label="📥 Baixar arquivo Excel (.xlsx)",
-            data=excel_data,
-            file_name=uploaded_file.name.replace('.pdf', '.xlsx'),
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+    for page in reader.pages:
+        text = page.extract_text()
+        if not text:
+            continue
+
+        lines = text.split("\n")
+        for line in lines:
+            line_str = line.strip()
+
+            # Filtrar linhas de cabeçalho, rodapé, links e datas
+            if (
+                not line_str
+                or "SUMÁRIO DE" in line_str
+                or "Sumário de" in line_str
+                or "Id File" in line_str
+                or "Total Geral" in line_str
+                or "https://" in line_str
+                or re.match(r"^\d{2}/\d{2}/\d{4}", line_str)
+            ):
+                continue
+
+            # Capturar padrão: ID_FILE + 4 valores monetários
+            file_match = re.search(
+                r"(\d{3}\.\d{3}\.?|\b\d{6}\b)\s+([\d\.\,]+)\s+([\d\.\,]+)\s+([\d\.\,]+)\s+([\d\.\,]+)",
+                line_str,
+            )
+            if file_match:
+                file_id = file_match.group(1).replace(".", "")
+                tot_geral = to_float(file_match.group(2))
+                rec_oper = to_float(file_match.group(3))
+                custo_op = to_float(file_match.group(4))
+                tot_net = to_float(file_match.group(5))
+
+                records.append({
+                    "ID_FILE": int(file_id) if file_id.isdigit() else file_id,
+                    "TOTAL_GERAL": tot_geral,
+                    "RECEITA_OPERACIONAL": rec_oper,
+                    "CUSTO_OPERACAO_RATEIO": custo_op,
+                    "TOTAL_NET_PREVISTO": tot_net,
+                })
+
+    return pd.DataFrame(records)
+
+
+if uploaded_files:
+    all_dfs = []
+
+    with st.spinner("Processando relatórios PDF..."):
+        for pdf_file in uploaded_files:
+            df_part = parse_managetour_file_pdf(pdf_file)
+            if not df_part.empty:
+                all_dfs.append(df_part)
+
+    if all_dfs:
+        df_full = pd.concat(all_dfs, ignore_index=True)
+
+        st.markdown("---")
+        st.subheader("📌 Indicadores e Resumo dos Dados")
+
+        tot_g = round(df_full["TOTAL_GERAL"].sum(), 2)
+        rec_o = round(df_full["RECEITA_OPERACIONAL"].sum(), 2)
+        cus_o = round(df_full["CUSTO_OPERACAO_RATEIO"].sum(), 2)
+        tot_n = round(df_full["TOTAL_NET_PREVISTO"].sum(), 2)
+        total_records = len(df_full)
+
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("Qtd. Registros", f"{total_records:,}")
+        c2.metric("Total Geral", f"R$ {tot_g:,.2f}")
+        c3.metric("Receita Operacional", f"R$ {rec_o:,.2f}")
+        c4.metric("Custo Op. Rateio", f"R$ {cus_o:,.2f}")
+        c5.metric("Total NET Previsto", f"R$ {tot_n:,.2f}")
+
+        # Linha de soma ao final
+        row_total = {
+            "ID_FILE": "TOTAL GERAL",
+            "TOTAL_GERAL": tot_g,
+            "RECEITA_OPERACIONAL": rec_o,
+            "CUSTO_OPERACAO_RATEIO": cus_o,
+            "TOTAL_NET_PREVISTO": tot_n,
+        }
+        df_export = pd.concat(
+            [df_full, pd.DataFrame([row_total])], ignore_index=True
         )
-        
-    except Exception as e:
-        st.error(f"Ocorreu um erro ao processar o arquivo: {e}")
+
+        st.markdown("### 📋 Tabela Convertida")
+        st.dataframe(df_export, use_container_width=True)
+
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
+            df_export.to_excel(
+                writer, index=False, sheet_name="ManageTour_File"
+            )
+
+        st.download_button(
+            label="📥 Baixar Planilha Excel (.xlsx)",
+            data=buffer.getvalue(),
+            file_name="ManageTour_Relatorio_File.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
+    else:
+        st.error("Nenhum registro válido foi encontrado no PDF selecionado.")
