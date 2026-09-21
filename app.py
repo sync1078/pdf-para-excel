@@ -10,7 +10,7 @@ st.set_page_config(
 
 st.title("📊 Conversor de Relatórios (PDF → Excel)")
 st.write(
-    "Upload de relatórios em PDF (Detalhados, Sumários por Categoria, por Cliente ou por File) para gerar planilhas formatadas para Banco de Dados."
+    "Upload de relatórios em PDF (Detalhados, Sumários por Categoria ou Sumários por Cliente) para gerar planilhas formatadas para Banco de Dados."
 )
 
 uploaded_files = st.file_uploader(
@@ -55,70 +55,6 @@ def adjust_fees_to_match_target(df_input, target_fee):
         adjusted_count += 1
 
     df.drop(columns=["raw_fee", "round_diff"], inplace=True)
-    return df
-
-
-def parse_managetour_file_ pdf(reader):
-    records = []
-
-    def to_float(val_str):
-        return float(val_str.replace(".", "").replace(",", "."))
-
-    for page in reader.pages:
-        text = page.extract_text()
-        if not text:
-            continue
-
-        lines = text.split("\n")
-        for line in lines:
-            line_str = line.strip()
-
-            if (
-                not line_str
-                or "SUMÁRIO DE" in line_str
-                or "Sumário de" in line_str
-                or "Id File" in line_str
-                or "Total Geral" in line_str
-                or "https://" in line_str
-                or re.match(r"^\d{2}/\d{2}/\d{4}", line_str)
-            ):
-                continue
-
-            file_match = re.search(
-                r"^\d+\s*(\d{3}\.\d{3}\.?|\d{6})\s+([\d\.\,]+)\s+([\d\.\,]+)\s+([\d\.\,]+)\s+([\d\.\,]+)",
-                line_str,
-            )
-            if file_match:
-                file_id = file_match.group(1).replace(".", "")
-                tot_geral = to_float(file_match.group(2))
-                rec_oper = to_float(file_match.group(3))
-                custo_op = to_float(file_match.group(4))
-                tot_net = to_float(file_match.group(5))
-
-                records.append({
-                    "FILE": int(file_id) if file_id.isdigit() else file_id,
-                    "TOTAL_GERAL": tot_geral,
-                    "RECEITA_OPERACIONAL": rec_oper,
-                    "CUSTO_OPERACAO_RATEIO": custo_op,
-                    "TOTAL_NET_PREVISTO": tot_net,
-                })
-
-    df = pd.DataFrame(records)
-    if not df.empty:
-        tot_geral_soma = round(df["TOTAL_GERAL"].sum(), 2)
-        rec_oper_soma = round(df["RECEITA_OPERACIONAL"].sum(), 2)
-        custo_op_soma = round(df["CUSTO_OPERACAO_RATEIO"].sum(), 2)
-        tot_net_soma = round(df["TOTAL_NET_PREVISTO"].sum(), 2)
-
-        row_total = {
-            "FILE": "TOTAL GERAL",
-            "TOTAL_GERAL": tot_geral_soma,
-            "RECEITA_OPERACIONAL": rec_oper_soma,
-            "CUSTO_OPERACAO_RATEIO": custo_op_soma,
-            "TOTAL_NET_PREVISTO": tot_net_soma,
-        }
-        df = pd.concat([df, pd.DataFrame([row_total])], ignore_index=True)
-
     return df
 
 
@@ -374,10 +310,7 @@ def process_pdf_file(pdf_file):
     reader = pypdf.PdfReader(pdf_file)
     first_page_text = reader.pages[0].extract_text() if reader.pages else ""
 
-    if "Total NET - Previsto" in first_page_text:
-        df = parse_managetour_file_pdf(reader)
-        pdf_type = "managetour_file"
-    elif "Receita Operacional" in first_page_text or "Custo Operacao" in first_page_text:
+    if "Receita Operacional" in first_page_text or "Custo Operacao" in first_page_text:
         df = parse_elotour_client_pdf(reader)
         pdf_type = "elotour_cliente"
     elif "SUMÁRIO DE" in first_page_text or "Total Geral (Soma)" in first_page_text:
@@ -394,7 +327,6 @@ if uploaded_files:
     all_dfs_detalhado = []
     all_dfs_sumario = []
     all_dfs_elotour = []
-    all_dfs_file = []
 
     with st.spinner("Processando arquivos PDF..."):
         for file in uploaded_files:
@@ -409,11 +341,8 @@ if uploaded_files:
                 elif p_type == "elotour_cliente":
                     df_clean = df_result[df_result["CLIENTE"] != "TOTAL GERAL"]
                     all_dfs_elotour.append(df_clean)
-                elif p_type == "managetour_file":
-                    df_clean = df_result[df_result["FILE"] != "TOTAL GERAL"]
-                    all_dfs_file.append(df_clean)
 
-    # 1. Relatórios Detalhados
+    # 1. Exibição de Relatórios Detalhados
     if all_dfs_detalhado:
         df_full_det = pd.concat(all_dfs_detalhado, ignore_index=True)
 
@@ -485,51 +414,7 @@ if uploaded_files:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # 2. Relatórios ManageTour por File (5 Colunas Completo)
-    if all_dfs_file:
-        df_full_file = pd.concat(all_dfs_file, ignore_index=True)
-
-        st.markdown("---")
-        st.subheader("📑 Relatório Sumário por File (ManageTour)")
-
-        tot_g = round(df_full_file["TOTAL_GERAL"].sum(), 2)
-        rec_o = round(df_full_file["RECEITA_OPERACIONAL"].sum(), 2)
-        cus_o = round(df_full_file["CUSTO_OPERACAO_RATEIO"].sum(), 2)
-        tot_n = round(df_full_file["TOTAL_NET_PREVISTO"].sum(), 2)
-
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Total Geral", f"R$ {tot_g:,.2f}")
-        c2.metric("Receita Operacional", f"R$ {rec_o:,.2f}")
-        c3.metric("Custo Operação Rateio", f"R$ {cus_o:,.2f}")
-        c4.metric("Total NET Previsto", f"R$ {tot_n:,.2f}")
-
-        row_total_file = {
-            "FILE": "TOTAL GERAL",
-            "TOTAL_GERAL": tot_g,
-            "RECEITA_OPERACIONAL": rec_o,
-            "CUSTO_OPERACAO_RATEIO": cus_o,
-            "TOTAL_NET_PREVISTO": tot_n,
-        }
-        df_export_file = pd.concat(
-            [df_full_file, pd.DataFrame([row_total_file])], ignore_index=True
-        )
-
-        st.dataframe(df_export_file, use_container_width=True)
-
-        buffer_file = io.BytesIO()
-        with pd.ExcelWriter(buffer_file, engine="openpyxl") as writer:
-            df_export_file.to_excel(
-                writer, index=False, sheet_name="Sumario_ManageTour_File"
-            )
-
-        st.download_button(
-            label="📥 Baixar Planilha Excel ManageTour File (.xlsx)",
-            data=buffer_file.getvalue(),
-            file_name="Relatorio_ManageTour_File.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-
-    # 3. Relatórios EloTour (Sumário por Cliente)
+    # 2. Exibição de Relatórios EloTour (Sumário por Cliente)
     if all_dfs_elotour:
         df_full_elo = pd.concat(all_dfs_elotour, ignore_index=True)
 
@@ -571,7 +456,7 @@ if uploaded_files:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
         )
 
-    # 4. Relatórios de Sumário por Categoria
+    # 3. Exibição de Relatórios de Sumário por Categoria
     if all_dfs_sumario:
         df_full_sum = pd.concat(all_dfs_sumario, ignore_index=True)
 
