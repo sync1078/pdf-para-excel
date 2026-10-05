@@ -1,160 +1,125 @@
 import streamlit as st
 import pandas as pd
-import pdfplumber
+from pdfminer.high_level import extract_pages
+from pdfminer.layout import LTTextContainer
 import re
 import io
 
 st.set_page_config(page_title="Conversor PDF para Excel", layout="wide")
 
-def is_numeric(s):
-    """Verifica se a string é composta por números/valores financeiros."""
-    return bool(re.match(r'^-?[\d.,]+$', s.strip()))
-
-def parse_service_line(line_words):
-    """
-    Separa rigorosamente as palavras de uma linha de serviço entre a descrição do Serviço,
-    a Categoria e as colunas numéricas (ADT, CHD, INF, QTD, TARIFA, VALOR_VENDA, VALOR_FEE).
-    """
-    adt = chd = inf = qtd = voucher = tarifa = venda = fee = ""
-    servico_words = []
-    categoria_words = []
-    
-    for w in line_words:
-        text = w['text']
-        x0 = w['x0']
-        
-        # Identificação de colunas por coordenadas X exatas do relatório
-        if 275 <= x0 <= 298 and is_numeric(text):
-            adt = text
-        elif 305 <= x0 <= 328 and is_numeric(text):
-            chd = text
-        elif 335 <= x0 <= 358 and is_numeric(text):
-            inf = text
-        elif 365 <= x0 <= 388 and is_numeric(text):
-            qtd = text
-        elif 390 <= x0 < 470 and is_numeric(text):
-            voucher = text
-        elif 470 <= x0 < 528 and is_numeric(text):
-            tarifa = text
-        elif 528 <= x0 < 588 and is_numeric(text):
-            venda = text
-        elif 588 <= x0 < 720:
-            categoria_words.append(text)
-        elif 720 <= x0 < 770:
-            pass  # Percentual do Fee (ex: 1,00 %) - ignorado
-        elif 770 <= x0 <= 820 and is_numeric(text):
-            fee = text
-        elif 70 <= x0 < 588:
-            # Texto da descrição do serviço
-            servico_words.append(text)
-            
-    servico = " ".join(servico_words).strip()
-    categoria = " ".join(categoria_words).strip()
-    
-    return servico, categoria, adt, chd, inf, qtd, voucher, tarifa, venda, fee
-
-def extract_client_info(line_words):
-    """Extrai ID (FILE), Nome do Cliente e Site da linha do cliente."""
-    full_text = " ".join([w['text'] for w in line_words]).strip()
-    file_id, site = "", ""
-    
-    m_file = re.search(r'^(\d{5,})', full_text)
-    if m_file:
-        file_id = m_file.group(1)
-        full_text = full_text.replace(file_id, "", 1)
-        
-    sites = re.findall(r'\((.*?)\)', full_text)
-    if sites:
-        site = sites[-1]
-        full_text = full_text.rsplit(f"({site})", 1)[0]
-        
-    nome = re.sub(r'^[\s-]*', '', full_text).strip()
-    return file_id, nome, site
-
 def process_pdf(pdf_file):
-    data = []
+    all_data = []
     
-    with pdfplumber.open(pdf_file) as pdf:
-        for page in pdf.pages:
-            # x_tolerance=1.5 evita a fusão de textos sobrepostos com números de colunas
-            words = page.extract_words(x_tolerance=1.5, y_tolerance=3)
+    # Processa página a página utilizando extração de containers nativos do PDF
+    for page_layout in extract_pages(pdf_file):
+        lines = []
+        for element in page_layout:
+            if isinstance(element, LTTextContainer):
+                for text_line in element:
+                    txt = text_line.get_text().strip()
+                    if txt:
+                        lines.append((text_line.bbox[0], text_line.bbox[1], txt))
+                        
+        # Agrupa elementos pertencentes à mesma linha horizontal
+        lines_grouped = {}
+        for x0, y0, txt in lines:
+            y_round = round(y0, 1)
+            matched_y = None
+            for y_key in lines_grouped:
+                if abs(y_key - y_round) <= 2.5:
+                    matched_y = y_key
+                    break
+            if matched_y is None:
+                matched_y = y_round
+                lines_grouped[matched_y] = []
+            lines_grouped[matched_y].append((x0, txt))
             
-            # Agrupa palavras por altura (eixo Y)
-            words_by_top = sorted(words, key=lambda w: w['top'])
-            lines = []
-            current_line = []
-            current_top = None
+        sorted_ys = sorted(lines_grouped.keys(), reverse=True)
+        
+        current_file = ""
+        current_nome = ""
+        current_site = ""
+        
+        for y in sorted_ys:
+            row_items = sorted(lines_grouped[y], key=lambda item: item[0])
+            first_x, first_txt = row_items[0]
             
-            for w in words_by_top:
-                if current_top is None or abs(w['top'] - current_top) <= 3:
-                    current_line.append(w)
-                    if current_top is None:
-                        current_top = w['top']
-                else:
-                    lines.append(current_line)
-                    current_line = [w]
-                    current_top = w['top']
-            if current_line:
-                lines.append(current_line)
-                
-            current_file, current_nome, current_site = "", "", ""
+            # Pula cabeçalhos e rodapés
+            if re.search(r'(DATA SERVIÇO|FEE -|ORIGEM:|INÍCIO|FIM SERVIÇO|EMISSÃO:|SERVIÇO:|Página|TOTAL)', first_txt):
+                continue
             
-            for line in lines:
-                line_sorted = sorted(line, key=lambda w: w['x0'])
-                if not line_sorted:
-                    continue
+            # Identifica Linha do Cliente (ex: "743133 - RODRIGO ALMEIDA (SITE BROCKER)")
+            m_client = re.match(r'^(\d{5,})\s*-\s*(.*?)\s*\((.*?)\)$', first_txt)
+            if m_client and first_x < 50:
+                current_file = m_client.group(1)
+                current_nome = m_client.group(2).strip()
+                current_site = m_client.group(3).strip()
+                continue
+            
+            # Identifica Linha do Serviço (começa com data ex: "04/09/26")
+            m_date = re.match(r'^\d{2}/\d{2}/\d{2}$', first_txt)
+            if m_date and first_x < 50:
+                data_servico = first_txt
                 
-                primeira_palavra = line_sorted[0]['text']
-                inicio_x0 = line_sorted[0]['x0']
+                servico = ""
+                adt = chd = inf = qtd = voucher = tarifa = venda = categoria = fee = ""
                 
-                # Ignora cabeçalhos e rodapés da página
-                if re.search(r'(DATA|FEE|ORIGEM|SERVIÇO|TOTAL|Página|EMISSÃO|INÍCIO|FIM)', primeira_palavra, re.IGNORECASE):
-                    continue
+                for x0, txt in row_items[1:]:
+                    if 70 <= x0 < 270:
+                        servico = (servico + " " + txt).strip()
+                    elif 270 <= x0 < 305:
+                        adt = txt
+                    elif 305 <= x0 < 335:
+                        chd = txt
+                    elif 335 <= x0 < 365:
+                        inf = txt
+                    elif 365 <= x0 < 390:
+                        qtd = txt
+                    elif 390 <= x0 < 470:
+                        voucher = txt
+                    elif 470 <= x0 < 528:
+                        tarifa = txt
+                    elif 528 <= x0 < 588:
+                        venda = txt
+                    elif 588 <= x0 < 720:
+                        categoria = (categoria + " " + txt).strip()
+                    elif 720 <= x0 < 780:
+                        pass  # Ignora % do Fee
+                    elif 780 <= x0:
+                        fee = txt
+                        
+                all_data.append({
+                    'FILE': current_file,
+                    'NOME_CLIENTE': current_nome,
+                    'SITE_ORIGEM': current_site,
+                    'DATA_SERVICO': data_servico,
+                    'SERVICO': servico,
+                    'CATEGORIA_SERVICO': categoria,
+                    'ADT': adt,
+                    'CHD': chd,
+                    'INF': inf,
+                    'QTD': qtd,
+                    'VOUCHER_RECIBO': voucher,
+                    'TARIFA': tarifa,
+                    'VALOR_VENDA': venda,
+                    'VALOR_FEE': fee
+                })
                 
-                # 1. Linha do Cliente (começa com número do FILE ex: 743133)
-                if re.match(r'^\d{5,}$', primeira_palavra) and inicio_x0 < 40:
-                    current_file, current_nome, current_site = extract_client_info(line_sorted)
-                    continue
-                
-                # 2. Linha do Serviço (começa com Data ex: 04/09/26)
-                elif re.match(r'^\d{2}/\d{2}/\d{2}$', primeira_palavra) and inicio_x0 < 40:
-                    data_servico = primeira_palavra
-                    resto_palavras = [w for w in line_sorted if w['x0'] >= 70]
-                    
-                    servico, categoria, adt, chd, inf, qtd, voucher, tarifa, venda, fee = parse_service_line(resto_palavras)
-                    
-                    data.append({
-                        'FILE': current_file,
-                        'NOME_CLIENTE': current_nome,
-                        'SITE_ORIGEM': current_site,
-                        'DATA_SERVICO': data_servico,
-                        'SERVICO': servico,
-                        'CATEGORIA_SERVICO': categoria,
-                        'ADT': adt,
-                        'CHD': chd,
-                        'INF': inf,
-                        'QTD': qtd,
-                        'VOUCHER_RECIBO': voucher,
-                        'TARIFA': tarifa,
-                        'VALOR_VENDA': venda,
-                        'VALOR_FEE': fee
-                    })
-                    
-                # 3. Linha de continuação do nome do serviço (quando quebra em 2 linhas)
-                elif inicio_x0 >= 70 and inicio_x0 < 270 and len(data) > 0:
-                    servico_extra, cat_extra, _, _, _, _, _, _, _, _ = parse_service_line(line_sorted)
-                    if servico_extra:
-                        data[-1]['SERVICO'] += " " + servico_extra
-                    if cat_extra:
-                        data[-1]['CATEGORIA_SERVICO'] += " " + cat_extra
+            # Trata linhas com nomes de serviços e categorias que quebram em duas linhas
+            elif 70 <= first_x < 270 and len(all_data) > 0 and current_file != "":
+                for x0, txt in row_items:
+                    if 70 <= x0 < 270:
+                        all_data[-1]['SERVICO'] = (all_data[-1]['SERVICO'] + " " + txt).strip()
+                    elif 588 <= x0 < 720:
+                        all_data[-1]['CATEGORIA_SERVICO'] = (all_data[-1]['CATEGORIA_SERVICO'] + " " + txt).strip()
 
-    df = pd.DataFrame(data, columns=[
+    df = pd.DataFrame(all_data, columns=[
         'FILE', 'NOME_CLIENTE', 'SITE_ORIGEM', 'DATA_SERVICO', 'SERVICO', 
         'CATEGORIA_SERVICO', 'ADT', 'CHD', 'INF', 'QTD', 'VOUCHER_RECIBO', 
         'TARIFA', 'VALOR_VENDA', 'VALOR_FEE'
     ])
     
-    # Tratamento e conversão de tipos numéricos
+    # Tratamento de colunas numéricas
     cols_numericas = ['ADT', 'CHD', 'INF', 'QTD', 'TARIFA', 'VALOR_VENDA', 'VALOR_FEE']
     for col in cols_numericas:
         if col in df.columns:
@@ -173,10 +138,10 @@ st.markdown("Transformação do relatório de **Manutenção Comissionada**.")
 uploaded_file = st.file_uploader("Selecione o arquivo PDF", type="pdf")
 
 if uploaded_file is not None:
-    with st.spinner("Mapeando coordenadas e processando tabela..."):
+    with st.spinner("Lendo estrutura PDF de alta precisão..."):
         try:
             df_final = process_pdf(uploaded_file)
-            st.success("Arquivo convertido com sucesso!")
+            st.success(f"Arquivo convertido com sucesso! Total de {len(df_final)} registros processados.")
             
             st.write("### Prévia dos Dados:")
             st.dataframe(df_final.head(15))
