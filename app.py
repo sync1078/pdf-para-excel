@@ -4,155 +4,163 @@ import pdfplumber
 import re
 import io
 
-def parse_pdf_text(text):
+st.set_page_config(page_title="Conversor PDF para Excel", layout="wide")
+
+def extract_client_info(text):
+    """Extrai FILE, NOME DO CLIENTE e SITE DE ORIGEM a partir da linha de cabeçalho do cliente."""
+    text_str = str(text)
+    file_id, nome, site = "", "", ""
+    
+    # Extrai ID (ex: 743133)
+    file_match = re.search(r'\b(\d{5,})\b', text_str)
+    if file_match:
+        file_id = file_match.group(1)
+        
+    # Extrai Site Origem dentro dos parênteses
+    site_match = re.search(r'\((.*?)\)', text_str)
+    if site_match:
+        site = site_match.group(1)
+        
+    # Limpa o texto restante para obter apenas o nome
+    nome = text_str
+    if file_id: nome = nome.replace(file_id, "")
+    if site_match: nome = nome.replace(f"({site})", "")
+    nome = re.sub(r'[-\n|]', ' ', nome)
+    nome = re.sub(r'\s+', ' ', nome).strip()
+    
+    return file_id, nome, site
+
+def extract_service_info(text):
+    """Extrai DATA DO SERVIÇO e NOME DO SERVIÇO a partir da célula principal."""
+    text_str = str(text)
+    date_match = re.search(r'(\d{2}/\d{2}/\d{2})', text_str)
+    data_servico = date_match.group(1) if date_match else ""
+    
+    servico = text_str
+    if data_servico:
+        servico = servico.replace(data_servico, "")
+    servico = re.sub(r'[-\n|]', ' ', servico)
+    servico = re.sub(r'\s+', ' ', servico).strip()
+    
+    return data_servico, servico
+
+def process_pdf(pdf_file):
     data = []
-    current_file = None
-    current_client = None
-    current_site = None
-    buffer = []
     
-    # Expressões Regulares
-    file_re = re.compile(r'^(\d{6})-?$')
-    client_re = re.compile(r'^(.*?)\s*\(((?:SITE|CONSUMIDOR)[^)]*)\)$', re.IGNORECASE)
-    combined_re = re.compile(r'^(\d{6})\s*-?\s*(.*?)\s*\(((?:SITE|CONSUMIDOR)[^)]*)\)$', re.IGNORECASE)
-    date_re = re.compile(r'^\d{2}/\d{2}/\d{2,4}$')
-    
-    # TRUQUE MÁGICO: O PDF quebra as colunas em várias linhas antes do pipe "|".
-    # Aqui nós "colamos" essas quebras de volta para reconstruir a linha da tabela.
-    text = text.replace('\n |', ' |').replace('\n|', ' |')
-    
-    lines = [line.strip() for line in text.split('\n') if line.strip()]
-    
-    for line in lines:
-        detail = None
-        
-        # Tenta fatiar a linha pelos pipes '|'
-        if '|' in line:
-            parts = [p.strip() for p in line.split('|')]
-            # Se a linha tem várias colunas e a coluna ADT (índice 1) é um número, é um serviço!
-            if len(parts) >= 9 and parts[1].isdigit():
-                try:
-                    adt = parts[1]
-                    chd = parts[2]
-                    inf = parts[3]
-                    qtd = parts[4]
-                    voucher = parts[5]
-                    tarifa = parts[6]
-                    venda = parts[7]
-                    categoria = parts[8]
-                    fee = parts[-1] # O Fee é sempre o último item da linha
+    with pdfplumber.open(pdf_file) as pdf:
+        for page in pdf.pages:
+            # Estratégia focada em alinhamento de texto (ótimo para relatórios de sistema)
+            table_settings = {
+                "vertical_strategy": "text", 
+                "horizontal_strategy": "text"
+            }
+            table = page.extract_table(table_settings)
+            
+            if not table:
+                continue
+                
+            current_file = ""
+            current_nome = ""
+            current_site = ""
+            
+            for row in table:
+                # Limpa nulos e junta a linha para avaliação
+                row_clean = [str(cell).strip() if cell else "" for cell in row]
+                full_row = " ".join(row_clean)
+                
+                # Pular cabeçalhos do PDF
+                if "SERVIÇO" in full_row and "DATA" in full_row:
+                    continue
+                if "FEE" in full_row and "Lista Serviços" in full_row:
+                    continue
                     
-                    detail = (adt, chd, inf, qtd, voucher, tarifa, venda, categoria, fee)
-                except IndexError:
-                    pass
+                # Identifica Linha do Cliente
+                if re.search(r'\b\d{5,}\b', full_row) and '(' in full_row and ')' in full_row:
+                    current_file, current_nome, current_site = extract_client_info(full_row)
+                    continue
                     
-        if detail:
-            adt, chd, inf, qtd, voucher, tarifa, venda, categoria, fee = detail
+                # Identifica Linha do Serviço (onde a data está presente)
+                if re.search(r'\d{2}/\d{2}/\d{2}', full_row):
+                    data_servico, servico = extract_service_info(row_clean[0])
+                    
+                    # Garantindo leitura mesmo se algumas colunas do PDF vierem mescladas
+                    # Lendo da esquerda para a direita (quantidades)
+                    adt = row_clean[1] if len(row_clean) > 1 else ""
+                    chd = row_clean[2] if len(row_clean) > 2 else ""
+                    inf = row_clean[3] if len(row_clean) > 3 else ""
+                    qtd = row_clean[4] if len(row_clean) > 4 else ""
+                    
+                    voucher = row_clean[5] if len(row_clean) > 5 and not re.match(r'^[\d,.]+$', row_clean[5]) else ""
+                    
+                    # Lendo da direita para a esquerda (valores são mais consistentes no final da tabela)
+                    fee = row_clean[-1] if len(row_clean) > 0 else ""
+                    categoria = row_clean[-3] if len(row_clean) > 2 else ""
+                    venda = row_clean[-4] if len(row_clean) > 3 else ""
+                    tarifa = row_clean[-5] if len(row_clean) > 4 else ""
+                    
+                    data.append({
+                        'FILE': current_file,
+                        'NOME_CLIENTE': current_nome,
+                        'SITE_ORIGEM': current_site,
+                        'DATA_SERVICO': data_servico,
+                        'SERVICO': servico,
+                        'CATEGORIA_SERVICO': categoria,
+                        'ADT': adt,
+                        'CHD': chd,
+                        'INF': inf,
+                        'QTD': qtd,
+                        'VOUCHER_RECIBO': voucher,
+                        'TARIFA': tarifa,
+                        'VALOR_VENDA': venda,
+                        'VALOR_FEE': fee
+                    })
+                    
+    # Cria o DataFrame com as colunas na exata ordem exigida pelo seu Excel
+    df = pd.DataFrame(data, columns=[
+        'FILE', 'NOME_CLIENTE', 'SITE_ORIGEM', 'DATA_SERVICO', 'SERVICO', 
+        'CATEGORIA_SERVICO', 'ADT', 'CHD', 'INF', 'QTD', 'VOUCHER_RECIBO', 
+        'TARIFA', 'VALOR_VENDA', 'VALOR_FEE'
+    ])
+    
+    # Conversão e limpeza de colunas numéricas (substituindo vírgula por ponto)
+    cols_numericas = ['ADT', 'CHD', 'INF', 'QTD', 'TARIFA', 'VALOR_VENDA', 'VALOR_FEE']
+    for col in cols_numericas:
+        if col in df.columns:
+            # Remove qualquer caractere que não seja dígito, vírgula, ponto ou sinal de menos
+            df[col] = df[col].astype(str).str.replace(r'[^\d,.-]', '', regex=True)
+            df[col] = df[col].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+            df[col] = pd.to_numeric(df[col], errors='coerce')
             
-            data_servico = None
-            servico = None
-            
-            # Buscar no histórico as linhas acima para achar a Data e o Nome do Serviço
-            for b in reversed(buffer):
-                if date_re.match(b):
-                    data_servico = b
-                elif not file_re.match(b) and not client_re.match(b) and not combined_re.match(b) and '|' not in b:
-                    # Ignorar linhas de totais ou números avulsos
-                    if not re.match(r'^\d+\s+\d+\s+\d+\s+\d+', b):
-                        if servico is None:
-                            servico = b
-            
-            # Limpeza financeira (ajusta R$ 1.000,00 para 1000.00 pro Excel entender)
-            def clean_number(val):
-                if not val: return 0.0
-                val = re.sub(r'[^\d.,]', '', val)
-                if not val: return 0.0
-                return float(val.replace('.', '').replace(',', '.'))
-            
-            data.append({
-                'FILE': current_file,
-                'NOME_CLIENTE': current_client,
-                'SITE_ORIGEM': current_site,
-                'DATA_SERVICO': data_servico,
-                'SERVICO': servico,
-                'CATEGORIA_SERVICO': categoria,
-                'ADT': float(adt) if adt else 0.0,
-                'CHD': float(chd) if chd else 0.0,
-                'INF': float(inf) if inf else 0.0,
-                'QTD': float(qtd) if qtd else 0.0,
-                'VOUCHER_RECIBO': voucher,
-                'TARIFA': clean_number(tarifa),
-                'VALOR_VENDA': clean_number(venda),
-                'VALOR_FEE': clean_number(fee)
-            })
-            buffer = [] # Limpa a memória após gravar a linha
-            continue
-            
-        # Atualizar quem é o Cliente atual
-        m_comb = combined_re.match(line)
-        if m_comb:
-            current_file = m_comb.group(1)
-            current_client = m_comb.group(2)
-            current_site = m_comb.group(3)
-        else:
-            m_file = file_re.match(line)
-            if m_file: current_file = m_file.group(1)
-            
-            m_client = client_re.match(line)
-            if m_client:
-                current_client = m_client.group(1)
-                current_site = m_client.group(2)
-        
-        buffer.append(line)
-        
-    return pd.DataFrame(data)
+    return df
 
-def to_excel(df):
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine='openpyxl') as writer:
-        df.to_excel(writer, index=False, sheet_name='Comissionada')
-    return output.getvalue()
-
-# --- INTERFACE STREAMLIT ---
-st.set_page_config(page_title="Conversor PDF para Excel", page_icon="📄", layout="wide")
-
+# -- INTERFACE STREAMLIT --
 st.title("📄 Conversor de PDF para Excel")
-st.subheader("Extrator de Manutenção Comissionada")
+st.markdown("Transforme o relatório PDF de **Manutenção Comissionada** no formato Excel padronizado instantaneamente.")
 
-uploaded_file = st.file_uploader("Selecione o relatório em formato PDF", type=["pdf"])
+uploaded_file = st.file_uploader("Selecione o arquivo PDF", type="pdf")
 
 if uploaded_file is not None:
-    with st.spinner("Analisando o PDF e juntando as tabelas..."):
-        text = ""
+    with st.spinner("Processando o arquivo, isso pode levar alguns segundos..."):
         try:
-            with pdfplumber.open(uploaded_file) as pdf:
-                for page in pdf.pages:
-                    # Extração do texto base
-                    page_text = page.extract_text(layout=False)
-                    if page_text:
-                        text += page_text + "\n"
-                        
-            df = parse_pdf_text(text)
+            df_final = process_pdf(uploaded_file)
             
-            if not df.empty:
-                st.success(f"Extração concluída com sucesso! {len(df)} serviços encontrados.")
-                st.dataframe(df.head(15)) 
-                
-                excel_data = to_excel(df)
-                
-                st.download_button(
-                    label="📥 Baixar arquivo Excel (.xlsx)",
-                    data=excel_data,
-                    file_name="MANUTENCAO_COMISSIONADA.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-                )
-            else:
-                st.warning("Não foi possível extrair a tabela corretamente.")
-                
-                # MODO DEBUG: Expander para ver como o texto do PDF está saindo "cru"
-                with st.expander("🛠️ Modo Debug - Ver texto bruto extraído do PDF"):
-                    st.info("O texto abaixo é exatamente como o computador está lendo o seu PDF. Se estiver muito desconfigurado, precisamos ajustar as Regras (Regex) de leitura.")
-                    st.text(text[:4000]) # Mostra um bom pedaço do texto extraído para diagnóstico
-        
+            st.success("Arquivo processado com sucesso!")
+            
+            # Mostra uma prévia na tela
+            st.write("### Prévia dos Dados:")
+            st.dataframe(df_final.head(10))
+            
+            # Botão de download (Convertendo para BytesIO)
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_final.to_excel(writer, index=False, sheet_name='Dados')
+            processed_data = output.getvalue()
+            
+            st.download_button(
+                label="⬇️ Baixar Planilha Excel",
+                data=processed_data,
+                file_name=uploaded_file.name.replace('.pdf', '.xlsx'),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
         except Exception as e:
-            st.error(f"Erro ao processar o arquivo: {e}")
+            st.error(f"Ocorreu um erro ao processar o arquivo: {e}")
