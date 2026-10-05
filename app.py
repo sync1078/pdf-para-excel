@@ -1,18 +1,20 @@
 """
-Conversor de relatórios de vendas (PDF -> Excel)
+Conversor de relatórios de vendas (PDF -> Excel) – saída ACHATADA (flatten)
 
-Tipos suportados:
-  - MANUTENÇÃO COMISSIONADA SITE        (1 PDF)
-  - MANUTENÇÃO COMISSIONADA APP         (2 PDFs - quinzenas, concatenados)
-  - MANUTENÇÃO COMISSIONADA MANAGETOUR  (1 PDF)
-
-Estratégia: NÃO usa detecção de tabelas. Cada página é lida como texto bruto
-(`page.extract_text(layout=True)`), dividida em linhas, e cada linha é classificada por
-Regex (cliente, serviço, total, lixo). Os registros viram uma lista de dicionários e só
-no final são convertidos em DataFrame com colunas FIXAS – portanto nunca surgem colunas
-extras nem deslocamento de dados.
+Arquitetura (sem nenhum método de tabela do pdfplumber):
+  1. `page.extract_text(layout=True)` preserva os espaços originais da página.
+  2. O texto é dividido com `split('\\n')` e varrido linha a linha, com ESTADO em memória:
+        current_file / current_cliente / current_origem
+     que é copiado para cada linha de serviço seguinte (cliente -> serviços).
+  3. Linha de cliente  : Regex  ^(\\d{5,})\\s*-\\s*(nome)\\s*\\((origem)\\)
+     Linha de serviço  : contém data dd/mm/aa. As colunas são separadas por 2+ espaços
+                         (re.split(r'\\s{2,}')); o nome do serviço fica antes da data e o
+                         bloco da direita (ADT CHD INF QTD [VOUCHER] TARIFA VENDA CATEGORIA FEE)
+                         é lido por gramática fixa, então VOUCHER vazio nunca desloca valores.
+  4. Os registros viram uma lista de dicionários -> um único DataFrame com colunas FIXAS.
 """
 
+import datetime as dt
 import io
 import re
 import unicodedata
@@ -24,26 +26,26 @@ from openpyxl.styles import Alignment, Font
 from openpyxl.utils import get_column_letter
 
 # --------------------------------------------------------------------------------------
-# Colunas fixas
+# Colunas de saída (ordem exata)
 # --------------------------------------------------------------------------------------
 
-# "% FEE" guarda o percentual que aparece entre a categoria e o VALOR FEE (ex.: "1,00 %").
-# Se não quiser essa coluna no Excel, basta remover "% FEE" da lista abaixo.
 COLS_SERVICOS = [
-    "SERVIÇO",
-    "DATA SERVIÇO",
+    "FILE",
+    "NOME_CLIENTE",
+    "SITE_ORIGEM",
+    "DATA_SERVICO",
+    "SERVICO",
+    "CATEGORIA_SERVICO",
     "ADT",
-    "CHD.",
+    "CHD",
     "INF",
     "QTD",
-    "VOUCHER/RECIBO",
+    "VOUCHER_RECIBO",
     "TARIFA",
-    "VALOR VENDA",
-    "CATEGORIA SERVIÇO",
-    "% FEE",
-    "VALOR FEE",
+    "VALOR_VENDA",
+    "VALOR_FEE",
 ]
-MONEY_SERVICOS = ["TARIFA", "VALOR VENDA", "VALOR FEE"]
+MONEY_SERVICOS = ["TARIFA", "VALOR_VENDA", "VALOR_FEE"]
 
 COLS_MANAGETOUR = [
     "Id",
@@ -61,13 +63,19 @@ REPORTS = {
     "MANUTENÇÃO COMISSIONADA MANAGETOUR": {"kind": "managetour", "multi": False},
 }
 
+
+class ParseError(ValueError):
+    """Erro explícito e esperado de leitura/validação (mostrado ao usuário)."""
+
+    raw = None  # texto bruto da página 1, para diagnóstico
+
+
 # --------------------------------------------------------------------------------------
 # Utilitários
 # --------------------------------------------------------------------------------------
 
 
 def norm(text: str) -> str:
-    """Sem acentos, MAIÚSCULO, espaços colapsados."""
     text = unicodedata.normalize("NFKD", str(text))
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
     return re.sub(r"\s+", " ", text).strip().upper()
@@ -84,8 +92,8 @@ _BR_THOUSANDS = re.compile(r"^-?\d{1,3}(?:\.\d{3})+(?:,\d+)?$")
 _BR_PLAIN = re.compile(r"^-?\d+(?:,\d+)?$")
 
 
-def parse_br_number(token):
-    """'1.234,56' -> 1234.56 | '2' -> 2. Se não for número, devolve o texto original."""
+def br_to_number(token):
+    """'1.234,56' -> 1234.56 | '2' -> 2. Texto não numérico é devolvido sem alteração."""
     if not isinstance(token, str):
         return token
     s = token.strip()
@@ -95,23 +103,43 @@ def parse_br_number(token):
     return token
 
 
+def to_float(token):
+    value = br_to_number(token)
+    return float(value) if isinstance(value, (int, float)) else value
+
+
+def to_date(text: str):
+    for fmt in ("%d/%m/%y", "%d/%m/%Y"):
+        try:
+            return dt.datetime.strptime(text, fmt).date()
+        except ValueError:
+            continue
+    return text  # mantém o texto se não for uma data válida
+
+
 # --------------------------------------------------------------------------------------
-# Leitura do PDF (texto bruto, preservando espaços)
+# Leitura do PDF: texto bruto com layout preservado
 # --------------------------------------------------------------------------------------
 
 
-def extract_pages_text(file_bytes: bytes) -> list[str]:
-    pages = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+def extract_pages_text(file_bytes: bytes, filename: str) -> list[str]:
+    try:
+        pdf = pdfplumber.open(io.BytesIO(file_bytes))
+    except Exception as exc:  # noqa: BLE001 - convertido em erro explícito para o usuário
+        raise ParseError(f"{filename}: não foi possível abrir o arquivo como PDF ({type(exc).__name__}).") from exc
+
+    with pdf:
         if not pdf.pages:
-            raise ValueError("O PDF não possui páginas.")
-        for page in pdf.pages:
-            pages.append(page.extract_text(layout=True) or "")
+            raise ParseError(f"{filename}: o PDF não possui páginas.")
+        pages = [page.extract_text(layout=True) or "" for page in pdf.pages]
+
+    if not any(p.strip() for p in pages):
+        raise ParseError(f"{filename}: o PDF não tem texto selecionável (pode ser imagem escaneada).")
     return pages
 
 
 # --------------------------------------------------------------------------------------
-# Relatórios APP / SITE
+# APP / SITE
 # --------------------------------------------------------------------------------------
 
 JUNK_SERVICOS = [
@@ -125,238 +153,237 @@ JUNK_SERVICOS = [
     r"^ORIGEM\s*:",
     r"^SERVICO\s*:",
     r"BROCKER TURISMO",
-    r"^(\d{2}/\d{2}/\d{2,4}\s*)+$",  # linha só com datas do cabeçalho (período)
+    r"^(\d{2}/\d{2}/\d{2,4}\s*)+$",
 ]
-
 HEADER_WORDS = {
     "SERVICO", "DATA", "ADT", "CHD", "CHD.", "INF", "QTD", "VOUCHER/RECIBO", "VOUCHER",
     "RECIBO", "TARIFA", "VALOR", "VENDA", "CATEGORIA", "FEE", "%",
 }
 
-# Linha de cliente/agência: "743133 - RODRIGO ALMEIDA (SITE BROCKER) 2 1 0 3 127,00 1,27"
+# Cliente: "743133 - RODRIGO ALMEIDA (SITE BROCKER) 2 1 0 3 127,00 1,27" -> file, nome, origem
+# (depois do ')' só podem existir números = totais do cliente, que não entram no flatten)
+CLIENT_START_RE = re.compile(r"^\d{5,}\s*-\s*\S")
 CLIENT_RE = re.compile(
-    rf"^(?P<code>\d{{3,}})\s*-\s*(?P<name>.+?)(?P<tail>(?:\s+{NUM_TOKEN})+)\s*$"
+    rf"^(?P<file>\d{{5,}})\s*-\s*(?P<nome>.*?)\s*\((?P<origem>[^()]*)\)(?:\s+{NUM_TOKEN})*\s*$"
 )
-# Cliente cujo nome não traz números na mesma linha
-CLIENT_NAME_RE = re.compile(r"^\d{3,}\s*-\s*\S")
+CLIENT_PARTIAL_RE = re.compile(r"^(?P<file>\d{5,})\s*-\s*(?P<nome>.*)$")
 
 DATE_RE = re.compile(r"(?<!\d)\d{2}/\d{2}/(?:\d{4}|\d{2})(?!\d)")
 
-# O que vem DEPOIS da data numa linha de serviço
-SERVICE_REST_RE = re.compile(
+# Bloco à direita da data: ADT CHD INF QTD [VOUCHER] TARIFA VENDA CATEGORIA [x,xx %] FEE
+SERVICE_RIGHT_RE = re.compile(
     rf"""^
     (?P<adt>\d+)\s+(?P<chd>\d+)\s+(?P<inf>\d+)\s+(?P<qtd>\d+)\s+
     (?:(?P<voucher>(?!{MONEY}(?:\s|$))\S+)\s+)?
     (?P<tarifa>{MONEY})\s+
     (?P<venda>{MONEY})\s+
     (?P<cat>.*?)\s*
-    (?:(?P<pct>\d+(?:,\d+)?\s*%)\s+)?
+    (?:\d+(?:,\d+)?\s*%\s+)?
     (?P<fee>{MONEY})
     \s*$""",
     re.VERBOSE,
 )
-
-NUMERIC_ONLY_RE = re.compile(rf"^(?:{NUM_TOKEN})(?:\s+{NUM_TOKEN})*$")
-
-
-def map_tail(tokens: list[str]):
-    """Mapeia os números do fim de linhas de cliente/total para as colunas."""
-    n = len(tokens)
-    if n < 6 or n > 8:
-        return None
-    d = {
-        "ADT": tokens[0],
-        "CHD.": tokens[1],
-        "INF": tokens[2],
-        "QTD": tokens[3],
-        "VALOR VENDA": tokens[-2],
-        "VALOR FEE": tokens[-1],
-    }
-    if n == 7:
-        d["TARIFA"] = tokens[4]
-    elif n == 8:
-        d["VOUCHER/RECIBO"], d["TARIFA"] = tokens[4], tokens[5]
-    return d
+NUMERIC_ONLY_RE = re.compile(rf"^{NUM_TOKEN}(?:\s+{NUM_TOKEN})*$")
 
 
-def parse_service_line(line: str):
-    """Procura 'nome + data + valores'. Retorna (nome, data, match) ou None."""
-    for m in DATE_RE.finditer(line):
-        rest = line[m.end():].strip()
-        mm = SERVICE_REST_RE.match(rest)
-        if mm:
-            return line[: m.start()].strip(), m.group(), mm
+def parse_service_line(raw: str):
+    """
+    Colunas separadas por 2+ espaços. Retorna (nome_servico, data, match_direita) ou None.
+    """
+    cols = re.split(r"\s{2,}", raw.strip())
+    date_idx = next((i for i, c in enumerate(cols) if re.fullmatch(DATE_RE, c)), None)
+    if date_idx is not None:
+        nome = " ".join(cols[:date_idx]).strip()
+        right = " ".join(" ".join(cols[date_idx + 1:]).split())
+        m = SERVICE_RIGHT_RE.match(right)
+        if m:
+            return nome, cols[date_idx], m
+
+    # Data colada ao texto por um único espaço: procura a data dentro da linha
+    line = collapse(raw)
+    for dm in DATE_RE.finditer(line):
+        m = SERVICE_RIGHT_RE.match(line[dm.end():].strip())
+        if m:
+            return line[: dm.start()].strip(), dm.group(), m
     return None
 
 
-def parse_servicos(pages_text: list[str], label: str, include_totals: bool,
-                   extra_terms: list[str], convert: bool):
-    """Retorna (records, ignored, warnings) para os relatórios APP/SITE."""
-    num = parse_br_number if convert else (lambda x: x)
+def parse_servicos(pages_text: list[str], label: str, extra_terms: list[str]):
+    """
+    Retorna (records, avisos, conferencia).
+    conferencia = (ok: bool | None, texto) comparando com o TOTAL RELATÓRIO do PDF.
+    """
     records: list[dict] = []
-    ignored: list[dict] = []
-    warnings: list[str] = []
-    buffer: list[str] = []
-    stats = {"continuacoes": 0}
-    current_page = 0
+    avisos: list[str] = []
+    total_pdf = None
 
-    def new_record(kind: str, name: str = "") -> dict:
+    # Estado em memória
+    current_file = current_cliente = current_origem = None
+    pending_client = None  # cliente cujo nome quebrou em mais de uma linha
+    boundary = 0  # índice do 1º serviço do cliente atual
+    buffer: list[str] = []  # linhas de texto solto (nome de serviço quebrado)
+
+    def new_record(nome: str) -> dict:
         rec = {c: None for c in COLS_SERVICOS}
-        rec["SERVIÇO"] = name
-        rec["_kind"] = kind
-        rec["_empty_prefix"] = False
+        rec["FILE"] = current_file
+        rec["NOME_CLIENTE"] = current_cliente
+        rec["SITE_ORIGEM"] = current_origem
+        rec["SERVICO"] = nome
+        rec["_empty_prefix"] = not nome
         return rec
 
-    def ignore(text: str, reason: str):
-        ignored.append({"Arquivo": label, "Página": current_page, "Motivo": reason, "Texto": text})
-
-    def fill_tail(rec: dict, tokens: list[str]) -> bool:
-        mapped = map_tail(tokens)
-        if mapped is None:
-            return False
-        for col, tok in mapped.items():
-            rec[col] = num(tok)
-        return True
-
     def flush(next_rec):
-        """Decide a quem pertencem as linhas de texto soltas (nomes quebrados em várias linhas)."""
+        """Atribui as linhas soltas ao serviço correto (acima, abaixo ou divididas)."""
         if not buffer:
             return
         lines = list(buffer)
-        text = " ".join(lines)
         buffer.clear()
-        stats["continuacoes"] += len(lines)
+        text = " ".join(lines)
+        prev = records[-1] if len(records) > boundary else None
 
-        prev = records[-1] if records else None
-        prev_is_svc = prev is not None and prev["_kind"] == "service"
-        next_is_svc = next_rec is not None and next_rec["_kind"] == "service"
-
-        if next_is_svc and not next_rec["SERVIÇO"]:
-            if prev_is_svc and prev["_empty_prefix"]:
+        if next_rec is not None and not next_rec["SERVICO"]:
+            if prev is not None and prev["_empty_prefix"]:
                 k = len(lines) // 2  # nome centralizado: metade acima, metade abaixo
-                prev["SERVIÇO"] = f"{prev['SERVIÇO']} {' '.join(lines[:k])}".strip()
-                next_rec["SERVIÇO"] = " ".join(lines[k:])
+                prev["SERVICO"] = f"{prev['SERVICO']} {' '.join(lines[:k])}".strip()
+                next_rec["SERVICO"] = " ".join(lines[k:])
             else:
-                next_rec["SERVIÇO"] = text
-        elif prev_is_svc:
-            prev["SERVIÇO"] = f"{prev['SERVIÇO']} {text}".strip()
-        elif next_is_svc:
-            next_rec["SERVIÇO"] = f"{text} {next_rec['SERVIÇO']}".strip()
-        elif prev is not None and prev["_kind"] in ("client", "total"):
-            prev["SERVIÇO"] = f"{prev['SERVIÇO']} {text}".strip()
+                next_rec["SERVICO"] = text
+        elif prev is not None:
+            prev["SERVICO"] = f"{prev['SERVICO']} {text}".strip()
+        elif next_rec is not None:
+            next_rec["SERVICO"] = f"{text} {next_rec['SERVICO']}".strip()
         else:
-            rec = new_record("text", text)
-            records.append(rec)
-            warnings.append(f"{label}: texto solto sem linha de dados associada: '{text}'")
+            avisos.append(f"{label}: texto solto sem serviço associado: '{text}'")
+
+    def set_client(m):
+        nonlocal current_file, current_cliente, current_origem
+        current_file = int(m.group("file"))
+        current_cliente = m.group("nome").strip()
+        current_origem = m.group("origem").strip()
+
+    def close_pending_without_origin():
+        nonlocal current_file, current_cliente, current_origem, pending_client
+        pm = CLIENT_PARTIAL_RE.match(pending_client)
+        current_file, current_cliente, current_origem = int(pm.group("file")), pm.group("nome").strip(), ""
+        avisos.append(f"{label}: cliente sem '(origem)' reconhecível: '{pending_client}'")
+        pending_client = None
 
     for page_no, page_text in enumerate(pages_text, start=1):
-        current_page = page_no
         for raw in page_text.split("\n"):
             line = collapse(raw)
             if not line:
                 continue
             n = norm(line)
-            is_client_start = bool(CLIENT_NAME_RE.match(line))
+            client_start = bool(CLIENT_START_RE.match(line))
 
-            # 1) Lixo de quebra de página (linhas de cliente são sempre protegidas)
-            if not is_client_start:
-                if any(re.search(p, n) for p in JUNK_SERVICOS) or (
-                    extra_terms and any(t in n for t in extra_terms)
-                ):
-                    ignore(line, "lixo de cabeçalho/rodapé")
+            # 1) Lixo de quebra de página (linhas de cliente são protegidas)
+            if not client_start:
+                if any(re.search(p, n) for p in JUNK_SERVICOS) or any(t in n for t in extra_terms):
                     continue
-                tokens_up = n.split()
-                if tokens_up and all(t in HEADER_WORDS for t in tokens_up):
-                    ignore(line, "cabeçalho de colunas")
+                if all(t in HEADER_WORDS for t in n.split()):
                     continue
 
-            # 2) Linha de cliente/agência
-            m = CLIENT_RE.match(line) if is_client_start else None
-            if m:
-                rec = new_record("client", f"{m.group('code')} - {m.group('name').strip()}")
-                if not fill_tail(rec, m.group("tail").split()):
-                    rec["SERVIÇO"] = line  # contagem de números inesperada: guarda a linha inteira
-                    warnings.append(f"{label} (pág. {page_no}): linha de cliente com números inesperados: '{line}'")
-                flush(rec)
-                records.append(rec)
-                continue
-            if is_client_start:
-                rec = new_record("client", line)
-                flush(rec)
-                records.append(rec)
-                continue
-
-            # 3) Linha de serviço (tem data dd/mm/aa)
-            svc = parse_service_line(line)
-            if svc:
-                name, date, mm = svc
-                rec = new_record("service", name)
-                rec["_empty_prefix"] = not name
-                rec["DATA SERVIÇO"] = date
-                rec["ADT"], rec["CHD."], rec["INF"], rec["QTD"] = (
-                    num(mm.group("adt")), num(mm.group("chd")), num(mm.group("inf")), num(mm.group("qtd"))
-                )
-                rec["VOUCHER/RECIBO"] = mm.group("voucher")
-                rec["TARIFA"] = num(mm.group("tarifa"))
-                rec["VALOR VENDA"] = num(mm.group("venda"))
-                rec["CATEGORIA SERVIÇO"] = mm.group("cat").strip() or None
-                rec["% FEE"] = mm.group("pct")
-                rec["VALOR FEE"] = num(mm.group("fee"))
-                flush(rec)
-                records.append(rec)
-                continue
-
-            # 4) Linhas de TOTAL (TOTAL ORIGEM, TOTAL RELATÓRIO...)
-            if n.startswith("TOTAL"):
-                tokens = line.split()
-                idx = next((i for i, t in enumerate(tokens) if re.fullmatch(NUM_TOKEN, t)), len(tokens))
-                rec = new_record("total", " ".join(tokens[:idx]))
-                if tokens[idx:] and not fill_tail(rec, tokens[idx:]):
-                    rec["SERVIÇO"] = line
-                    warnings.append(f"{label} (pág. {page_no}): linha de total com números inesperados: '{line}'")
-                flush(rec)
-                if include_totals:
-                    records.append(rec)
+            # 2) Novo cliente: atualiza o estado
+            if client_start:
+                flush(None)
+                if pending_client:
+                    close_pending_without_origin()
+                boundary = len(records)
+                m = CLIENT_RE.match(line)
+                if m:
+                    set_client(m)
                 else:
-                    ignore(line, "linha de total (opção desmarcada)")
+                    pending_client = line  # nome quebrado: completa nas próximas linhas
                 continue
 
-            # 5a) Cliente com nome quebrado: o fim do nome + os números vêm na linha seguinte
-            prev = records[-1] if records else None
-            if prev is not None and prev["_kind"] in ("client", "total") and prev["ADT"] is None:
-                mt = re.match(rf"^(?P<name>.*?\D)(?P<tail>(?:\s+{NUM_TOKEN})+)\s*$", line)
-                if mt and map_tail(mt.group("tail").split()):
-                    flush(None)  # texto solto pendente pertence ao nome do cliente
-                    prev["SERVIÇO"] = f"{prev['SERVIÇO']} {mt.group('name').strip()}".strip()
-                    fill_tail(prev, mt.group("tail").split())
-                    stats["continuacoes"] += 1
-                    continue
+            # 3) Linha de serviço
+            svc = parse_service_line(raw)
+            if svc:
+                if pending_client:
+                    close_pending_without_origin()
+                nome, data, m = svc
+                rec = new_record(nome)
+                rec["DATA_SERVICO"] = data
+                rec["ADT"], rec["CHD"], rec["INF"], rec["QTD"] = (
+                    int(m.group("adt")), int(m.group("chd")), int(m.group("inf")), int(m.group("qtd"))
+                )
+                rec["VOUCHER_RECIBO"] = m.group("voucher")  # costuma vir vazio
+                rec["TARIFA"] = to_float(m.group("tarifa"))
+                rec["VALOR_VENDA"] = to_float(m.group("venda"))
+                rec["CATEGORIA_SERVICO"] = m.group("cat").strip() or None
+                rec["VALOR_FEE"] = to_float(m.group("fee"))
+                if current_file is None:
+                    avisos.append(f"{label} (pág. {page_no}): serviço antes de qualquer cliente: '{line}'")
+                flush(rec)
+                records.append(rec)
+                continue
 
-            # 5b) Números soltos logo após cliente/total sem números
+            # 4) TOTAL RELATÓRIO (usado só para conferência) e demais totais (ignorados)
+            if n.startswith("TOTAL"):
+                flush(None)
+                if n.startswith("TOTAL RELATORIO"):
+                    tokens = line.split()
+                    nums = [t for t in tokens if re.fullmatch(NUM_TOKEN, t)]
+                    if len(nums) >= 6:
+                        total_pdf = {
+                            "ADT": br_to_number(nums[-6]), "CHD": br_to_number(nums[-5]),
+                            "INF": br_to_number(nums[-4]), "QTD": br_to_number(nums[-3]),
+                            "VALOR_VENDA": to_float(nums[-2]), "VALOR_FEE": to_float(nums[-1]),
+                        }
+                continue
+
+            # 5) Continuação do nome de um cliente quebrado em várias linhas
+            if pending_client:
+                combined = f"{pending_client} {line}"
+                m = CLIENT_RE.match(combined)
+                if m:
+                    set_client(m)
+                    pending_client = None
+                else:
+                    pending_client = combined
+                continue
+
+            # 6) Números soltos sem identificação (nada a anexar com segurança)
             if NUMERIC_ONLY_RE.match(line):
-                prev = records[-1] if records else None
-                if prev is not None and prev["_kind"] in ("client", "total") and prev["ADT"] is None \
-                        and fill_tail(prev, line.split()):
-                    continue
-                warnings.append(f"{label} (pág. {page_no}): linha numérica sem identificação: '{line}'")
-                ignore(line, "linha numérica órfã")
+                avisos.append(f"{label} (pág. {page_no}): linha numérica sem identificação: '{line}'")
                 continue
 
-            # 6) Qualquer outro texto: continuação do nome (quebra de linha dentro da célula)
+            # 7) Texto solto: nome de serviço que quebrou de linha
             buffer.append(line)
 
     flush(None)
+    if pending_client:
+        close_pending_without_origin()
 
-    if stats["continuacoes"]:
-        warnings.append(
-            f"{label}: {stats['continuacoes']} linha(s) de continuação de nome foram anexadas ao serviço/cliente "
-            "correspondente. Confira algumas no Excel."
+    if not records:
+        raise ParseError(
+            f"{label}: nenhuma linha de serviço (com data dd/mm/aa) foi reconhecida. "
+            "Veja o texto bruto em 'Diagnóstico'."
         )
-    return records, ignored, warnings
+
+    return records, avisos, reconcile(records, total_pdf, label)
+
+
+def reconcile(records: list[dict], total_pdf, label: str):
+    """Compara a soma das linhas extraídas com o TOTAL RELATÓRIO impresso no PDF."""
+    if total_pdf is None:
+        return None, f"{label}: linha 'TOTAL RELATÓRIO' não encontrada; conferência de totais não realizada."
+    diffs = []
+    for col in ("ADT", "CHD", "INF", "QTD"):
+        got = sum(r[col] or 0 for r in records)
+        if got != total_pdf[col]:
+            diffs.append(f"{col}: extraído {got} × PDF {total_pdf[col]}")
+    for col in ("VALOR_VENDA", "VALOR_FEE"):
+        got = round(sum(r[col] or 0 for r in records), 2)
+        if abs(got - total_pdf[col]) > 0.05:
+            diffs.append(f"{col}: extraído {got:,.2f} × PDF {total_pdf[col]:,.2f}")
+    if diffs:
+        return False, f"{label}: conferência com TOTAL RELATÓRIO divergente → " + "; ".join(diffs)
+    return True, f"{label}: conferência com TOTAL RELATÓRIO OK (ADT/CHD/INF/QTD/VENDA/FEE batem)."
 
 
 # --------------------------------------------------------------------------------------
-# Relatório MANAGETOUR
+# MANAGETOUR
 # --------------------------------------------------------------------------------------
 
 JUNK_MANAGETOUR = [
@@ -374,43 +401,41 @@ MT_RE = re.compile(
 )
 
 
-def parse_managetour(pages_text: list[str], label: str, extra_terms: list[str], convert: bool):
-    num = parse_br_number if convert else (lambda x: x)
-    records, ignored, warnings = [], [], []
+def parse_managetour(pages_text: list[str], label: str, extra_terms: list[str]):
+    records: list[dict] = []
+    avisos: list[str] = []
 
     for page_no, page_text in enumerate(pages_text, start=1):
         for raw in page_text.split("\n"):
             line = collapse(raw)
             if not line:
                 continue
-            n = norm(line)
-
             m = MT_RE.match(line)
             if m:
                 records.append({
-                    "Id": num(m.group("id")),
+                    "Id": int(m.group("id")),
                     "File": m.group("file"),  # texto: preserva '615.128' exatamente
-                    "Total Geral (Soma)": num(m.group("a")),
-                    "Receita Operacional (Soma)": num(m.group("b")),
-                    "Custo Operacao Rateio (Soma)": num(m.group("c")),
-                    "Total NET - Previsto (Soma)": num(m.group("d")),
+                    "Total Geral (Soma)": to_float(m.group("a")),
+                    "Receita Operacional (Soma)": to_float(m.group("b")),
+                    "Custo Operacao Rateio (Soma)": to_float(m.group("c")),
+                    "Total NET - Previsto (Soma)": to_float(m.group("d")),
                 })
                 continue
 
-            if any(re.search(p, n) for p in JUNK_MANAGETOUR) or (
-                extra_terms and any(t in n for t in extra_terms)
-            ):
-                ignored.append({"Arquivo": label, "Página": page_no, "Motivo": "lixo de cabeçalho/rodapé", "Texto": line})
+            n = norm(line)
+            if any(re.search(p, n) for p in JUNK_MANAGETOUR) or any(t in n for t in extra_terms):
                 continue
             if sum(1 for h in HEADER_MT if h in n) >= 3:
-                ignored.append({"Arquivo": label, "Página": page_no, "Motivo": "cabeçalho de colunas", "Texto": line})
                 continue
+            if len(re.findall(MONEY, line)) >= 2:  # parece dado, mas não bateu com o padrão
+                avisos.append(f"{label} (pág. {page_no}): linha com valores não reconhecida: '{line}'")
 
-            ignored.append({"Arquivo": label, "Página": page_no, "Motivo": "não reconhecida como transação", "Texto": line})
-            if len(re.findall(MONEY, line)) >= 2:
-                warnings.append(f"{label} (pág. {page_no}): linha com valores não reconhecida – '{line}'")
-
-    return records, ignored, warnings
+    if not records:
+        raise ParseError(
+            f"{label}: nenhuma linha transacional (Id File + 4 valores) foi reconhecida. "
+            "Veja o texto bruto em 'Diagnóstico'."
+        )
+    return records, avisos
 
 
 # --------------------------------------------------------------------------------------
@@ -419,15 +444,19 @@ def parse_managetour(pages_text: list[str], label: str, extra_terms: list[str], 
 
 
 def records_to_df(records: list[dict], columns: list[str]) -> pd.DataFrame:
-    clean = [{c: r.get(c) for c in columns} for r in records]  # descarta chaves internas
-    return pd.DataFrame(clean, columns=columns, dtype=object)  # object: mantém int como int
+    rows = [{c: r.get(c) for c in columns} for r in records]  # chaves internas ficam de fora
+    return pd.DataFrame(rows, columns=columns, dtype=object)
 
 
 def to_excel_bytes(df: pd.DataFrame, money_cols: list[str]) -> bytes:
+    out = df.copy()
+    if "DATA_SERVICO" in out.columns:
+        out["DATA_SERVICO"] = out["DATA_SERVICO"].map(lambda v: to_date(v) if isinstance(v, str) else v)
+
     buffer = io.BytesIO()
     sheet = "Relatorio"
     with pd.ExcelWriter(buffer, engine="openpyxl") as writer:
-        df.to_excel(writer, index=False, sheet_name=sheet)
+        out.to_excel(writer, index=False, sheet_name=sheet)
         ws = writer.sheets[sheet]
 
         for cell in ws[1]:
@@ -435,7 +464,7 @@ def to_excel_bytes(df: pd.DataFrame, money_cols: list[str]) -> bytes:
             cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
         ws.freeze_panes = "A2"
 
-        for i, col in enumerate(df.columns, start=1):
+        for i, col in enumerate(out.columns, start=1):
             max_len = len(str(col))
             for row in ws.iter_rows(min_row=2, min_col=i, max_col=i):
                 cell = row[0]
@@ -443,6 +472,8 @@ def to_excel_bytes(df: pd.DataFrame, money_cols: list[str]) -> bytes:
                     continue
                 if col in money_cols and isinstance(cell.value, (int, float)):
                     cell.number_format = "#,##0.00"
+                elif col == "DATA_SERVICO" and isinstance(cell.value, (dt.date, dt.datetime)):
+                    cell.number_format = "DD/MM/YYYY"
                 max_len = max(max_len, len(str(cell.value)))
             ws.column_dimensions[get_column_letter(i)].width = min(max_len + 2, 70)
     return buffer.getvalue()
@@ -455,6 +486,48 @@ def make_filename(tipo: str) -> str:
 # --------------------------------------------------------------------------------------
 # Interface Streamlit
 # --------------------------------------------------------------------------------------
+
+
+def run_conversion(tipo: str, files: list, extra_terms: list[str]) -> dict:
+    """Varre todos os PDFs numa única lista de registros e monta o DataFrame final."""
+    spec = REPORTS[tipo]
+    all_records: list[dict] = []
+    avisos: list[str] = []
+    conferencias: list[tuple] = []
+    raw_samples: dict[str, str] = {}
+
+    for f in sorted(files, key=lambda x: x.name):  # APP: 1ª quinzena → 2ª pelo nome do arquivo
+        pages = extract_pages_text(f.getvalue(), f.name)
+        raw_samples[f.name] = pages[0]
+        try:
+            if spec["kind"] == "servicos":
+                records, warn, conf = parse_servicos(pages, f.name, extra_terms)
+                conferencias.append(conf)
+            else:
+                records, warn = parse_managetour(pages, f.name, extra_terms)
+        except ParseError as exc:
+            exc.raw = pages[0]
+            raise
+        all_records.extend(records)
+        avisos.extend(warn)
+
+    if spec["kind"] == "servicos":
+        cols, money = COLS_SERVICOS, MONEY_SERVICOS
+    else:
+        cols, money = COLS_MANAGETOUR, MONEY_MANAGETOUR
+
+    df = records_to_df(all_records, cols)  # um único DataFrame, cabeçalho uma só vez
+    return {
+        "tipo": tipo,
+        "bytes": to_excel_bytes(df, money),
+        "filename": make_filename(tipo),
+        "preview": df.fillna("").astype(str),
+        "rows": len(df),
+        "files": [f.name for f in sorted(files, key=lambda x: x.name)],
+        "avisos": avisos,
+        "conferencias": conferencias,
+        "raw": raw_samples,
+    }
 
 
 def main():
@@ -477,14 +550,6 @@ def main():
     )
 
     with st.expander("Opções avançadas"):
-        convert = st.checkbox(
-            "Converter números (formato 1.234,56) para número no Excel", value=True
-        )
-        include_totals = st.checkbox(
-            "Manter linhas de TOTAL (TOTAL ORIGEM / TOTAL RELATÓRIO)",
-            value=True,
-            disabled=spec["kind"] != "servicos",
-        )
         extra_text = st.text_area(
             "Termos extras a ignorar (um por linha). Linhas que contenham o termo são descartadas.",
             value="",
@@ -493,68 +558,35 @@ def main():
     extra_terms = [norm(t) for t in extra_text.splitlines() if t.strip()]
 
     if st.button("Converter para Excel", type="primary"):
-        files = uploaded if isinstance(uploaded, list) else ([uploaded] if uploaded else [])
         st.session_state.pop("result", None)
+        files = uploaded if isinstance(uploaded, list) else ([uploaded] if uploaded else [])
 
         if not files:
             st.error("Envie ao menos um arquivo PDF antes de converter.")
+        elif spec["multi"] and len(files) != 2:
+            st.error(f"O relatório APP exige exatamente 2 arquivos (quinzenas); foram enviados {len(files)}.")
         else:
-            if spec["multi"] and len(files) != 2:
-                st.warning(f"Esperado 2 arquivos para o relatório APP; recebidos {len(files)}. Processando mesmo assim.")
-
-            files = sorted(files, key=lambda f: f.name)  # 1ª → 2ª quinzena pelo nome
-            all_records, all_ignored, all_warnings, raw_samples = [], [], [], {}
-            failed = False
-
-            with st.spinner("Lendo PDF(s)..."):
-                for f in files:
-                    try:
-                        pages = extract_pages_text(f.getvalue())
-                        raw_samples[f.name] = pages[0] if pages else ""
-                        if spec["kind"] == "servicos":
-                            rec, ign, warn = parse_servicos(pages, f.name, include_totals, extra_terms, convert)
-                        else:
-                            rec, ign, warn = parse_managetour(pages, f.name, extra_terms, convert)
-                        if not rec:
-                            raise ValueError(
-                                "Nenhuma linha de dados reconhecida. Veja o texto bruto em 'Diagnóstico' abaixo."
-                            )
-                        all_records += rec
-                        all_ignored += ign
-                        all_warnings += warn
-                    except Exception as exc:  # noqa: BLE001
-                        failed = True
-                        st.error(f"Falha ao ler **{f.name}**: {exc}")
-                        if f.name in raw_samples:
-                            with st.expander(f"Diagnóstico – texto bruto da página 1 de {f.name}"):
-                                st.code(raw_samples[f.name] or "(vazio)", language=None)
-
-            if not failed:
-                try:
-                    cols = COLS_SERVICOS if spec["kind"] == "servicos" else COLS_MANAGETOUR
-                    money = MONEY_SERVICOS if spec["kind"] == "servicos" else MONEY_MANAGETOUR
-                    df = records_to_df(all_records, cols)  # colunas fixas, header uma única vez
-                    st.session_state["result"] = {
-                        "tipo": tipo,
-                        "bytes": to_excel_bytes(df, money),
-                        "filename": make_filename(tipo),
-                        "preview": df.fillna("").astype(str),
-                        "rows": len(df),
-                        "files": [f.name for f in files],
-                        "warnings": all_warnings,
-                        "ignored": pd.DataFrame(all_ignored),
-                        "raw": raw_samples,
-                    }
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Falha ao gerar o Excel: {exc}")
+            try:
+                with st.spinner("Lendo PDF(s)..."):
+                    st.session_state["result"] = run_conversion(tipo, files, extra_terms)
+            except ParseError as exc:
+                st.error(str(exc))
+                if exc.raw:
+                    with st.expander("Diagnóstico – texto bruto da página 1"):
+                        st.code(exc.raw, language=None)
 
     result = st.session_state.get("result")
     if result and result["tipo"] == tipo:
         st.success(f"Conversão concluída: {result['rows']} linhas (arquivos: {', '.join(result['files'])}).")
 
-        if result["warnings"]:
-            with st.expander(f"⚠️ {len(result['warnings'])} aviso(s) – clique para conferir", expanded=True):
-                for w in result["warnings"][:200]:
+        for ok, text in result["conferencias"]:
+            if ok is True:
+                st.info("✅ " + text)
+            else:
+                st.warning("⚠️ " + text)
+        if result["avisos"]:
+            with st.expander(f"⚠️ {len(result['avisos'])} aviso(s) de linhas não encaixadas", expanded=True):
+                for w in result["avisos"][:200]:
                     st.write("• " + w)
 
         st.download_button(
@@ -566,10 +598,6 @@ def main():
 
         st.subheader("Pré-visualização")
         st.dataframe(result["preview"], use_container_width=True, height=450)
-
-        if not result["ignored"].empty:
-            with st.expander(f"Linhas ignoradas ({len(result['ignored'])}) – auditoria"):
-                st.dataframe(result["ignored"].astype(str), use_container_width=True, height=300)
 
         with st.expander("Diagnóstico – texto bruto da página 1 (como o pdfplumber enxergou)"):
             for name, txt in result["raw"].items():
