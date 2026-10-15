@@ -135,4 +135,64 @@ def process_sumario_managetour(pdf_file):
     reader = PdfReader(pdf_file)
     linhas_dados = []
     
-    # Captura linhas numéricas como: "1 601.0
+    padrao = re.compile(r'^\s*(\d+)\s+([\d.]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)')
+
+    for page in reader.pages:
+        texto = page.extract_text() or ""
+        lines_list = texto.splitlines()
+        for linha in lines_list:
+            match = padrao.match(linha.strip())
+            if match:
+                linhas_dados.append(match.groups())
+
+    colunas = [
+        'Item', 'Id File', 'Total Geral (Soma)', 
+        'Receita Operacional (Soma)', 'Custo Operacao Rateio (Soma)', 
+        'Total NET - Previsto (Soma)'
+    ]
+    df = pd.DataFrame(linhas_dados, columns=colunas)
+
+    for col in colunas[2:]:
+        df[col] = df[col].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    return df
+
+# ==============================================================================
+# INTERFACE STREAMLIT
+# ==============================================================================
+st.title("📄 Conversor de PDFs para Excel")
+
+tipo_relatorio = st.selectbox(
+    "Selecione o modelo do relatório PDF:",
+    ["Manutenção Comissionada Site", "Sumário de Vendas ManageTour"]
+)
+
+uploaded_file = st.file_uploader("Selecione o arquivo PDF", type="pdf")
+
+if uploaded_file is not None:
+    with st.spinner("Extraindo e processando dados do PDF..."):
+        try:
+            if tipo_relatorio == "Manutenção Comissionada Site":
+                df_final = process_manutencao_comissionada(uploaded_file)
+            else:
+                df_final = process_sumario_managetour(uploaded_file)
+                
+            st.success(f"Conversão concluída! Total de {len(df_final)} registros encontrados.")
+            
+            st.write("### Prévia dos Dados:")
+            st.dataframe(df_final.head(20))
+            
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_final.to_excel(writer, index=False, sheet_name='Dados')
+            processed_data = output.getvalue()
+            
+            st.download_button(
+                label="⬇️ Baixar Planilha Excel (.xlsx)",
+                data=processed_data,
+                file_name=uploaded_file.name.replace('.pdf', '_convertido.xlsx'),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error(f"Ocorreu um erro ao processar o arquivo: {e}")
