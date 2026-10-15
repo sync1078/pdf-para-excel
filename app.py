@@ -2,15 +2,18 @@ import streamlit as st
 import pandas as pd
 from pdfminer.high_level import extract_pages
 from pdfminer.layout import LTTextContainer
+from pypdf import PdfReader
 import re
 import io
 
-st.set_page_config(page_title="Conversor PDF para Excel", layout="wide")
+st.set_page_config(page_title="Conversor de PDF para Excel", layout="wide")
 
-def process_pdf(pdf_file):
+# ==============================================================================
+# FUNÇÃO 1: PROCESSAR MANUTENÇÃO COMISSIONADA (PDF TIPO SETEMBRO)
+# ==============================================================================
+def process_manutencao_comissionada(pdf_file):
     all_data = []
     
-    # Processa página a página utilizando extração de containers nativos do PDF
     for page_layout in extract_pages(pdf_file):
         lines = []
         for element in page_layout:
@@ -20,7 +23,6 @@ def process_pdf(pdf_file):
                     if txt:
                         lines.append((text_line.bbox[0], text_line.bbox[1], txt))
                         
-        # Agrupa elementos pertencentes à mesma linha horizontal
         lines_grouped = {}
         for x0, y0, txt in lines:
             y_round = round(y0, 1)
@@ -44,11 +46,9 @@ def process_pdf(pdf_file):
             row_items = sorted(lines_grouped[y], key=lambda item: item[0])
             first_x, first_txt = row_items[0]
             
-            # Pula cabeçalhos e rodapés
             if re.search(r'(DATA SERVIÇO|FEE -|ORIGEM:|INÍCIO|FIM SERVIÇO|EMISSÃO:|SERVIÇO:|Página|TOTAL)', first_txt):
                 continue
             
-            # Identifica Linha do Cliente (ex: "743133 - RODRIGO ALMEIDA (SITE BROCKER)")
             m_client = re.match(r'^(\d{5,})\s*-\s*(.*?)\s*\((.*?)\)$', first_txt)
             if m_client and first_x < 50:
                 current_file = m_client.group(1)
@@ -56,7 +56,6 @@ def process_pdf(pdf_file):
                 current_site = m_client.group(3).strip()
                 continue
             
-            # Identifica Linha do Serviço (começa com data ex: "04/09/26")
             m_date = re.match(r'^\d{2}/\d{2}/\d{2}$', first_txt)
             if m_date and first_x < 50:
                 data_servico = first_txt
@@ -84,7 +83,7 @@ def process_pdf(pdf_file):
                     elif 588 <= x0 < 720:
                         categoria = (categoria + " " + txt).strip()
                     elif 720 <= x0 < 780:
-                        pass  # Ignora % do Fee
+                        pass
                     elif 780 <= x0:
                         fee = txt
                         
@@ -105,7 +104,6 @@ def process_pdf(pdf_file):
                     'VALOR_FEE': fee
                 })
                 
-            # Trata linhas com nomes de serviços e categorias que quebram em duas linhas
             elif 70 <= first_x < 270 and len(all_data) > 0 and current_file != "":
                 for x0, txt in row_items:
                     if 70 <= x0 < 270:
@@ -119,7 +117,6 @@ def process_pdf(pdf_file):
         'TARIFA', 'VALOR_VENDA', 'VALOR_FEE'
     ])
     
-    # Tratamento de colunas numéricas
     cols_numericas = ['ADT', 'CHD', 'INF', 'QTD', 'TARIFA', 'VALOR_VENDA', 'VALOR_FEE']
     for col in cols_numericas:
         if col in df.columns:
@@ -131,56 +128,11 @@ def process_pdf(pdf_file):
             
     return df
 
-def processar_sumario_managetour(pdf_file):
+# ==============================================================================
+# FUNÇÃO 2: PROCESSAR SUMÁRIO DE VENDAS MANAGETOUR (PDF 195 PÁGINAS)
+# ==============================================================================
+def process_sumario_managetour(pdf_file):
     reader = PdfReader(pdf_file)
     linhas_dados = []
-    padrao = re.compile(r'^\s*(\d+)\s+([\d.]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)')
-
-    for page in reader.pages:
-        texto = page.extract_text() or ""
-        for linha in texto.split('\n'):
-            match = padrao.match(linha.strip())
-            if match:
-                linhas_dados.append(match.groups())
-
-    colunas = [
-        'Item', 'Id File', 'Total Geral (Soma)', 
-        'Receita Operacional (Soma)', 'Custo Operacao Rateio (Soma)', 
-        'Total NET - Previsto (Soma)'
-    ]
-    df = pd.DataFrame(linhas_dados, columns=colunas)
-
-    for col in colunas[2:]:
-        df[col] = df[col].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
-        df[col] = pd.to_numeric(df[col], errors='coerce')
-
-    return df
-
-# -- INTERFACE STREAMLIT --
-st.title("📄 Conversor de PDF para Excel")
-st.markdown("Transformação do relatório de **Manutenção Comissionada**.")
-
-uploaded_file = st.file_uploader("Selecione o arquivo PDF", type="pdf")
-
-if uploaded_file is not None:
-    with st.spinner("Lendo estrutura PDF de alta precisão..."):
-        try:
-            df_final = process_pdf(uploaded_file)
-            st.success(f"Arquivo convertido com sucesso! Total de {len(df_final)} registros processados.")
-            
-            st.write("### Prévia dos Dados:")
-            st.dataframe(df_final.head(15))
-            
-            output = io.BytesIO()
-            with pd.ExcelWriter(output, engine='openpyxl') as writer:
-                df_final.to_excel(writer, index=False, sheet_name='Dados')
-            processed_data = output.getvalue()
-            
-            st.download_button(
-                label="⬇️ Baixar Planilha Excel (.xlsx)",
-                data=processed_data,
-                file_name=uploaded_file.name.replace('.pdf', '_convertido.xlsx'),
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        except Exception as e:
-            st.error(f"Ocorreu um erro ao processar: {e}")
+    
+    # Captura linhas numéricas como: "1 601.0
