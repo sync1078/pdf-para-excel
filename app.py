@@ -131,6 +131,31 @@ def process_pdf(pdf_file):
             
     return df
 
+def processar_sumario_managetour(pdf_file):
+    reader = PdfReader(pdf_file)
+    linhas_dados = []
+    padrao = re.compile(r'^\s*(\d+)\s+([\d.]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)\s+([\d.,]+)')
+
+    for page in reader.pages:
+        texto = page.extract_text() or ""
+        for linha in texto.split('\n'):
+            match = padrao.match(linha.strip())
+            if match:
+                linhas_dados.append(match.groups())
+
+    colunas = [
+        'Item', 'Id File', 'Total Geral (Soma)', 
+        'Receita Operacional (Soma)', 'Custo Operacao Rateio (Soma)', 
+        'Total NET - Previsto (Soma)'
+    ]
+    df = pd.DataFrame(linhas_dados, columns=colunas)
+
+    for col in colunas[2:]:
+        df[col] = df[col].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+        df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    return df
+
 # -- INTERFACE STREAMLIT --
 st.title("📄 Conversor de PDF para Excel")
 st.markdown("Transformação do relatório de **Manutenção Comissionada**.")
