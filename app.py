@@ -167,7 +167,6 @@ def process_elotour_vendas(pdf_file):
     
     client_pattern = re.compile(r'CLIENTE:\s*(.*?)(?:\s+[\d.,]+TOTAL:|\s*$)', re.IGNORECASE)
     
-    # Padrão ajustado para exigir que o valor monetário termine obrigatoriamente com vírgula e 2 decimais
     row_pattern = re.compile(
         r'^\s*(\d{5,})\s*-\s*(.*?)\s+'
         r'(\d+)\s+(\d+)\s+(\d+)\s+(\d+)'
@@ -201,4 +200,74 @@ def process_elotour_vendas(pdf_file):
                     'PAX_TITULAR': pax.strip(),
                     'ADT': adt,
                     'CHD': chd,
-                    '
+                    'INF': inf,
+                    'QTD': qtd,
+                    'DATA_INICIO': d_ini,
+                    'DATA_FIM': d_fim,
+                    'LOCALIZADOR': loc.strip(),
+                    'VALOR_TOTAL': valor.strip(),
+                    'ENTIDADE': entidade.strip()
+                })
+                
+    colunas = [
+        'CLIENTE_AGENCIA', 'FILE', 'PAX_TITULAR', 'ADT', 'CHD', 'INF', 'QTD',
+        'DATA_INICIO', 'DATA_FIM', 'LOCALIZADOR', 'VALOR_TOTAL', 'ENTIDADE'
+    ]
+    df = pd.DataFrame(all_rows, columns=colunas)
+
+    cols_numericas = ['ADT', 'CHD', 'INF', 'QTD', 'VALOR_TOTAL']
+    for col in cols_numericas:
+        if col in df.columns:
+            df[col] = df[col].astype(str).str.strip()
+            df[col] = df[col].replace({'': '0', 'nan': '0', 'None': '0'})
+            df[col] = df[col].str.replace('.', '', regex=False).str.replace(',', '.', regex=False)
+            df[col] = df[col].str.replace(r'[^\d.-]', '', regex=True)
+            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+
+    return df
+
+# ==============================================================================
+# INTERFACE STREAMLIT
+# ==============================================================================
+st.title("📄 Conversor de PDFs para Excel")
+
+tipo_relatorio = st.selectbox(
+    "Selecione o modelo do relatório PDF:",
+    [
+        "Manutenção Comissionada Site", 
+        "Sumário de Vendas ManageTour",
+        "EloTour - Vendas Emissão"
+    ]
+)
+
+uploaded_file = st.file_uploader("Selecione o arquivo PDF", type="pdf")
+
+if uploaded_file is not None:
+    with st.spinner("Extraindo e processando dados do PDF..."):
+        try:
+            if tipo_relatorio == "Manutenção Comissionada Site":
+                df_final = process_manutencao_comissionada(uploaded_file)
+            elif tipo_relatorio == "Sumário de Vendas ManageTour":
+                df_final = process_sumario_managetour(uploaded_file)
+            else:
+                df_final = process_elotour_vendas(uploaded_file)
+                
+            val_sum = df_final['VALOR_TOTAL'].sum() if 'VALOR_TOTAL' in df_final.columns else 0
+            st.success(f"Conversão concluída! Total de {len(df_final)} registros encontrados. Soma total: R$ {val_sum:,.2f}")
+            
+            st.write("### Prévia dos Dados:")
+            st.dataframe(df_final.head(20))
+            
+            output = io.BytesIO()
+            with pd.ExcelWriter(output, engine='openpyxl') as writer:
+                df_final.to_excel(writer, index=False, sheet_name='Dados')
+            processed_data = output.getvalue()
+            
+            st.download_button(
+                label="⬇️ Baixar Planilha Excel (.xlsx)",
+                data=processed_data,
+                file_name=uploaded_file.name.replace('.pdf', '_convertido.xlsx'),
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            st.error(f"Ocorreu um erro ao processar o arquivo: {e}")
